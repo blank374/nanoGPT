@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="680" viewBox="0 0 920 680">
+<rect width="100%" height="100%" fill="white"/>
+<text x="60" y="35" font-family="Menlo, monospace" font-size="22">Dynamic Exit Threshold Sweep</text>
+<text x="60" y="52" font-family="Menlo, monospace" font-size="15">avg layers/token</text>
+<rect x="60" y="70" width="360" height="220" fill="#fafafa" stroke="#cccccc"/>
+<polyline points="60.0,274.8 102.4,239.1 144.7,202.1 187.1,164.2 229.4,137.7 271.8,120.5 314.1,107.5 356.5,93.6 398.8,89.0 420.0,85.2" fill="none" stroke="#1f77b4" stroke-width="2"/>
+<text x="60" y="318" font-family="Menlo, monospace" font-size="12">0.10</text>
+<text x="386" y="318" font-family="Menlo, monospace" font-size="12">0.95</text>
+<text x="12" y="82" font-family="Menlo, monospace" font-size="12">8.45</text>
+<text x="12" y="290" font-family="Menlo, monospace" font-size="12">1.52</text>
+<text x="500" y="52" font-family="Menlo, monospace" font-size="15">tokens/sec</text>
+<rect x="500" y="70" width="360" height="220" fill="#fafafa" stroke="#cccccc"/>
+<polyline points="500.0,85.2 542.4,274.8 584.7,273.1 627.1,273.9 669.4,273.8 711.8,272.9 754.1,273.4 796.5,273.2 838.8,270.8 860.0,269.8" fill="none" stroke="#2ca02c" stroke-width="2"/>
+<text x="500" y="318" font-family="Menlo, monospace" font-size="12">0.10</text>
+<text x="826" y="318" font-family="Menlo, monospace" font-size="12">0.95</text>
+<text x="452" y="82" font-family="Menlo, monospace" font-size="12">1681.90</text>
+<text x="452" y="290" font-family="Menlo, monospace" font-size="12">566.30</text>
+<text x="60" y="372" font-family="Menlo, monospace" font-size="15">agreement</text>
+<rect x="60" y="390" width="360" height="220" fill="#fafafa" stroke="#cccccc"/>
+<polyline points="60.0,594.8 102.4,583.7 144.7,531.6 187.1,468.4 229.4,438.6 271.8,434.9 314.1,416.3 356.5,412.6 398.8,408.9 420.0,405.2" fill="none" stroke="#9467bd" stroke-width="2"/>
+<text x="60" y="638" font-family="Menlo, monospace" font-size="12">0.10</text>
+<text x="386" y="638" font-family="Menlo, monospace" font-size="12">0.95</text>
+<text x="12" y="402" font-family="Menlo, monospace" font-size="12">1.02</text>
+<text x="12" y="610" font-family="Menlo, monospace" font-size="12">0.63</text>
+<text x="500" y="372" font-family="Menlo, monospace" font-size="15">perplexity</text>
+<rect x="500" y="390" width="360" height="220" fill="#fafafa" stroke="#cccccc"/>
+<polyline points="500.0,419.5 542.4,405.2 584.7,463.3 627.1,536.9 669.4,556.8 711.8,573.7 754.1,592.8 796.5,590.6 838.8,593.6 860.0,594.8" fill="none" stroke="#d62728" stroke-width="2"/>
+<text x="500" y="638" font-family="Menlo, monospace" font-size="12">0.10</text>
+<text x="826" y="638" font-family="Menlo, monospace" font-size="12">0.95</text>
+<text x="452" y="402" font-family="Menlo, monospace" font-size="12">11.91</text>
+<text x="452" y="610" font-family="Menlo, monospace" font-size="12">8.20</text>
+</svg>
