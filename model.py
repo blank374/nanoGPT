@@ -105,6 +105,23 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+class EarlyExitHead(nn.Module):
+    """
+    Lightweight prediction head for an intermediate layer.
+
+    The projection weight is tied to the main lm_head in GPT.__init__ when
+    dynamic_exit=True. That keeps the heads cheap: each exit only adds its own
+    LayerNorm parameters instead of a full vocab-sized output matrix.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln = LayerNorm(config.n_embd, bias=config.bias)
+        self.proj = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, x):
+        return self.proj(self.ln(x))
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -114,6 +131,15 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    dynamic_exit: bool = False
+    exit_layers: list = None # 1-indexed transformer layers, e.g. [3, 6, 9]
+    confidence_method: str = "max_prob" # "max_prob" or "entropy"
+    confidence_threshold: float = 0.95
+    entropy_threshold: float = 0.5
+    early_exit_loss_weight: float = 0.3
+    use_distillation: bool = False
+    distillation_temperature: float = 2.0
+    distillation_beta: float = 0.5
 
 class GPT(nn.Module):
 
@@ -131,11 +157,20 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.exit_layers = self._normalize_exit_layers(config.exit_layers)
+        self.exit_heads = nn.ModuleDict()
+        if config.dynamic_exit:
+            for layer_idx in self.exit_layers:
+                self.exit_heads[str(layer_idx)] = EarlyExitHead(config)
+        self.last_exit_stats = None
+        self.last_exit_details = None
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        for head in self.exit_heads.values():
+            head.proj.weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -146,6 +181,17 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        if config.dynamic_exit:
+            print(f"dynamic exit enabled at layers: {self.exit_layers}")
+
+    def _normalize_exit_layers(self, exit_layers):
+        if exit_layers is None:
+            exit_layers = [3, 6, 9]
+        exit_layers = sorted(set(int(layer) for layer in exit_layers))
+        assert all(1 <= layer <= self.config.n_layer for layer in exit_layers), \
+            f"exit_layers must be between 1 and n_layer={self.config.n_layer}"
+        # The final layer already uses the normal lm_head, so no extra head is needed there.
+        return [layer for layer in exit_layers if layer < self.config.n_layer]
 
     def get_num_params(self, non_embedding=True):
         """
@@ -167,28 +213,153 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _confidence_from_logits(self, logits):
+        probs = F.softmax(logits.float(), dim=-1)
+        max_prob = probs.max(dim=-1).values
+        entropy = -(probs * torch.log(probs.clamp_min(1e-9))).sum(dim=-1)
+        method = self.config.confidence_method
+        if method == "max_prob":
+            should_exit = max_prob >= self.config.confidence_threshold
+            confidence = max_prob
+        elif method == "entropy":
+            should_exit = entropy <= self.config.entropy_threshold
+            confidence = -entropy
+        else:
+            raise ValueError(f"unknown confidence_method: {method}")
+        return should_exit, confidence, max_prob, entropy
+
+    def _set_training_exit_stats(self, aux_losses):
+        if aux_losses:
+            self.last_exit_stats = {
+                "mode": "train",
+                "num_exit_heads": len(aux_losses),
+                "aux_loss": torch.stack([loss.detach() for loss in aux_losses]).mean().item(),
+                "early_exit_loss_weight": self.config.early_exit_loss_weight,
+            }
+        else:
+            self.last_exit_stats = None
+
+    def _forward_dynamic_inference(self, idx, pos):
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+
+        B, T, _ = x.size()
+        final_logits = None
+        active = torch.ones(B, T, dtype=torch.bool, device=idx.device)
+        exit_layer = torch.full((B, T), self.config.n_layer, dtype=torch.long, device=idx.device)
+        exit_confidence = torch.zeros(B, T, dtype=torch.float32, device=idx.device)
+        exit_max_prob = torch.zeros(B, T, dtype=torch.float32, device=idx.device)
+        exit_entropy = torch.zeros(B, T, dtype=torch.float32, device=idx.device)
+
+        for layer_idx, block in enumerate(self.transformer.h, start=1):
+            x_next = block(x)
+            # Tokens that already exited keep their old hidden state; active tokens
+            # continue to deepen. This is a research approximation inside dense
+            # PyTorch tensors, not a low-level compute-skipping kernel.
+            x = torch.where(active.unsqueeze(-1), x_next, x)
+
+            if layer_idx in self.exit_layers:
+                logits = self.exit_heads[str(layer_idx)](x)
+                should_exit, confidence, max_prob, entropy = self._confidence_from_logits(logits)
+                exiting = active & should_exit
+                if exiting.any():
+                    if final_logits is None:
+                        final_logits = torch.empty(B, T, self.config.vocab_size, device=idx.device, dtype=logits.dtype)
+                    final_logits[exiting] = logits[exiting]
+                    exit_layer[exiting] = layer_idx
+                    exit_confidence[exiting] = confidence[exiting].float()
+                    exit_max_prob[exiting] = max_prob[exiting].float()
+                    exit_entropy[exiting] = entropy[exiting].float()
+                    active = active & ~exiting
+                if not active.any():
+                    break
+
+        if active.any():
+            logits = self.lm_head(self.transformer.ln_f(x))
+            if final_logits is None:
+                final_logits = logits
+            else:
+                final_logits[active] = logits[active]
+            should_exit, confidence, max_prob, entropy = self._confidence_from_logits(logits)
+            exit_confidence[active] = confidence[active].float()
+            exit_max_prob[active] = max_prob[active].float()
+            exit_entropy[active] = entropy[active].float()
+
+        with torch.no_grad():
+            flat_exit_layer = exit_layer.view(-1)
+            counts = {
+                int(layer): int((flat_exit_layer == layer).sum().item())
+                for layer in self.exit_layers + [self.config.n_layer]
+            }
+            self.last_exit_stats = {
+                "mode": "eval",
+                "counts": counts,
+                "mean_exit_layer": exit_layer.float().mean().item(),
+                "early_exit_fraction": (exit_layer < self.config.n_layer).float().mean().item(),
+                "mean_max_prob": exit_max_prob.mean().item(),
+                "mean_entropy": exit_entropy.mean().item(),
+            }
+            self.last_exit_details = {
+                "exit_layer": exit_layer.detach(),
+                "confidence": exit_confidence.detach(),
+                "max_prob": exit_max_prob.detach(),
+                "entropy": exit_entropy.detach(),
+            }
+
+        return final_logits, None
+
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
+        if self.config.dynamic_exit and targets is None and not self.training:
+            return self._forward_dynamic_inference(idx, pos)
+
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        exit_outputs = []
+        for layer_idx, block in enumerate(self.transformer.h, start=1):
             x = block(x)
+            if self.config.dynamic_exit and targets is not None and layer_idx in self.exit_layers:
+                exit_logits = self.exit_heads[str(layer_idx)](x)
+                exit_outputs.append((layer_idx, exit_logits))
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            aux_losses = []
+            if self.config.dynamic_exit and exit_outputs:
+                for _, exit_logits in exit_outputs:
+                    ce_loss = F.cross_entropy(exit_logits.view(-1, exit_logits.size(-1)), targets.view(-1), ignore_index=-1)
+                    if self.config.use_distillation:
+                        T = self.config.distillation_temperature
+                        per_token_kl = F.kl_div(
+                            F.log_softmax(exit_logits / T, dim=-1),
+                            F.softmax(logits.detach() / T, dim=-1),
+                            reduction='none',
+                        ).sum(dim=-1)
+                        valid = targets != -1
+                        distill_loss = per_token_kl[valid].mean() * (T * T)
+                        beta = self.config.distillation_beta
+                        aux_losses.append(beta * ce_loss + (1.0 - beta) * distill_loss)
+                    else:
+                        aux_losses.append(ce_loss)
+            if self.config.dynamic_exit and aux_losses:
+                loss = loss + self.config.early_exit_loss_weight * torch.stack(aux_losses).mean()
+            self._set_training_exit_stats(aux_losses)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+            self.last_exit_stats = None
+            self.last_exit_details = None
 
         return logits, loss
 
@@ -303,17 +474,20 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, return_exit_stats=False):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        exit_stats = []
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
+            if return_exit_stats and self.config.dynamic_exit and self.last_exit_stats is not None:
+                exit_stats.append(self.last_exit_stats)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -327,4 +501,68 @@ class GPT(nn.Module):
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
+        if return_exit_stats:
+            return idx, exit_stats
         return idx
+
+    @torch.no_grad()
+    def generate_dynamic(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Dynamic Fast/Slow Path generation.
+
+        Unlike generate(), this always returns per-generated-token routing stats.
+        The normal full-depth path remains the fallback whenever confidence is
+        below the configured threshold at all early exits.
+        """
+        assert self.config.dynamic_exit, "generate_dynamic() requires GPTConfig(dynamic_exit=True)"
+        was_training = self.training
+        self.eval()
+        generation_stats = []
+
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            last_logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(last_logits, min(top_k, last_logits.size(-1)))
+                last_logits[last_logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(last_logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+            details = self.last_exit_details
+            # Keep stats for the generated token decision, i.e. the final context
+            # position whose logits produced idx_next. Batched generation records
+            # one entry per batch item per generated step.
+            for batch_idx in range(idx.size(0)):
+                exit_layer = int(details["exit_layer"][batch_idx, -1].item())
+                generation_stats.append({
+                    "token_id": int(idx_next[batch_idx, 0].item()),
+                    "exit_layer": exit_layer,
+                    "confidence": float(details["confidence"][batch_idx, -1].item()),
+                    "max_prob": float(details["max_prob"][batch_idx, -1].item()),
+                    "entropy": float(details["entropy"][batch_idx, -1].item()),
+                    "used_full_path": exit_layer == self.config.n_layer,
+                })
+
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        if was_training:
+            self.train()
+
+        if generation_stats:
+            avg_layers = sum(s["exit_layer"] for s in generation_stats) / len(generation_stats)
+            early_exit_rate = sum(not s["used_full_path"] for s in generation_stats) / len(generation_stats)
+        else:
+            avg_layers = 0.0
+            early_exit_rate = 0.0
+        summary = {
+            "avg_layers_per_token": avg_layers,
+            "layer_saving_ratio": 1.0 - avg_layers / self.config.n_layer if self.config.n_layer else 0.0,
+            "early_exit_rate": early_exit_rate,
+            "full_path_rate": 1.0 - early_exit_rate,
+            "exit_distribution": {
+                layer: sum(s["exit_layer"] == layer for s in generation_stats) / len(generation_stats)
+                for layer in self.exit_layers + [self.config.n_layer]
+            } if generation_stats else {},
+        }
+        return idx, generation_stats, summary

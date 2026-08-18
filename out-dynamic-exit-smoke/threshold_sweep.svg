@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="680" viewBox="0 0 920 680">
+<rect width="100%" height="100%" fill="white"/>
+<text x="60" y="35" font-family="Menlo, monospace" font-size="22">Dynamic Exit Threshold Sweep</text>
+<text x="60" y="52" font-family="Menlo, monospace" font-size="15">avg layers/token</text>
+<rect x="60" y="70" width="360" height="220" fill="#fafafa" stroke="#cccccc"/>
+<polyline points="60.0,180.0 229.4,180.0 420.0,180.0" fill="none" stroke="#1f77b4" stroke-width="2"/>
+<text x="60" y="318" font-family="Menlo, monospace" font-size="12">0.10</text>
+<text x="386" y="318" font-family="Menlo, monospace" font-size="12">0.95</text>
+<text x="12" y="82" font-family="Menlo, monospace" font-size="12">5.16</text>
+<text x="12" y="290" font-family="Menlo, monospace" font-size="12">2.84</text>
+<text x="500" y="52" font-family="Menlo, monospace" font-size="15">tokens/sec</text>
+<rect x="500" y="70" width="360" height="220" fill="#fafafa" stroke="#cccccc"/>
+<polyline points="500.0,274.8 669.4,98.4 860.0,85.2" fill="none" stroke="#2ca02c" stroke-width="2"/>
+<text x="500" y="318" font-family="Menlo, monospace" font-size="12">0.10</text>
+<text x="826" y="318" font-family="Menlo, monospace" font-size="12">0.95</text>
+<text x="452" y="82" font-family="Menlo, monospace" font-size="12">1264.91</text>
+<text x="452" y="290" font-family="Menlo, monospace" font-size="12">1118.52</text>
+<text x="60" y="372" font-family="Menlo, monospace" font-size="15">agreement</text>
+<rect x="60" y="390" width="360" height="220" fill="#fafafa" stroke="#cccccc"/>
+<polyline points="60.0,500.0 229.4,500.0 420.0,500.0" fill="none" stroke="#9467bd" stroke-width="2"/>
+<text x="60" y="638" font-family="Menlo, monospace" font-size="12">0.10</text>
+<text x="386" y="638" font-family="Menlo, monospace" font-size="12">0.95</text>
+<text x="12" y="402" font-family="Menlo, monospace" font-size="12">2.16</text>
+<text x="12" y="610" font-family="Menlo, monospace" font-size="12">-0.16</text>
+<text x="500" y="372" font-family="Menlo, monospace" font-size="15">perplexity</text>
+<rect x="500" y="390" width="360" height="220" fill="#fafafa" stroke="#cccccc"/>
+<polyline points="500.0,500.0 669.4,500.0 860.0,500.0" fill="none" stroke="#d62728" stroke-width="2"/>
+<text x="500" y="638" font-family="Menlo, monospace" font-size="12">0.10</text>
+<text x="826" y="638" font-family="Menlo, monospace" font-size="12">0.95</text>
+<text x="452" y="402" font-family="Menlo, monospace" font-size="12">35.48</text>
+<text x="452" y="610" font-family="Menlo, monospace" font-size="12">33.16</text>
+</svg>

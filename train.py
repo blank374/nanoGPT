@@ -54,6 +54,16 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# dynamic fast/slow path transformer
+dynamic_exit = False
+exit_layers = [3, 6, 9]
+confidence_method = "max_prob" # "max_prob" or "entropy"
+confidence_threshold = 0.95
+entropy_threshold = 0.5
+early_exit_loss_weight = 0.3
+use_distillation = False
+distillation_temperature = 2.0
+distillation_beta = 0.5
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -73,7 +83,7 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
@@ -145,7 +155,15 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  dynamic_exit=dynamic_exit, exit_layers=exit_layers,
+                  confidence_method=confidence_method,
+                  confidence_threshold=confidence_threshold,
+                  entropy_threshold=entropy_threshold,
+                  early_exit_loss_weight=early_exit_loss_weight,
+                  use_distillation=use_distillation,
+                  distillation_temperature=distillation_temperature,
+                  distillation_beta=distillation_beta) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -165,6 +183,13 @@ elif init_from == 'resume':
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+    # Older baseline checkpoints will not have these fields; keep the current
+    # command-line/default values so they can still be resumed unchanged.
+    for k in ['dynamic_exit', 'exit_layers', 'confidence_method', 'confidence_threshold',
+              'entropy_threshold', 'early_exit_loss_weight', 'use_distillation',
+              'distillation_temperature', 'distillation_beta']:
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -175,17 +200,24 @@ elif init_from == 'resume':
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys:
+        print(f"missing keys when loading checkpoint: {missing_keys}")
+    if unexpected_keys:
+        print(f"unexpected keys when loading checkpoint: {unexpected_keys}")
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+    if dynamic_exit:
+        print("WARNING: dynamic_exit is disabled for init_from='gpt2*' because pretrained GPT-2 checkpoints do not contain early-exit head LayerNorm weights.")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+    model_args['dynamic_exit'] = False
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)

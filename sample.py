@@ -16,10 +16,15 @@ num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
+return_exit_stats = False # print aggregate dynamic-exit routing stats after each sample
 seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
+# dynamic-exit inference knobs; only used by checkpoints trained with dynamic_exit=True
+confidence_method = "max_prob"
+confidence_threshold = 0.95
+entropy_threshold = 0.5
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
@@ -36,14 +41,20 @@ if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
+    model_args = checkpoint['model_args']
+    if model_args.get('dynamic_exit', False):
+        model_args = dict(model_args)
+        model_args['confidence_method'] = confidence_method
+        model_args['confidence_threshold'] = confidence_threshold
+        model_args['entropy_threshold'] = entropy_threshold
+    gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
 elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
@@ -84,6 +95,19 @@ x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            if return_exit_stats:
+                if model.config.dynamic_exit:
+                    y, exit_stats, exit_summary = model.generate_dynamic(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                else:
+                    y, exit_stats = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, return_exit_stats=True)
+                    exit_summary = None
+            else:
+                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))
+            if return_exit_stats and exit_stats and exit_summary is not None:
+                print(
+                    f"dynamic_exit: avg_layers/token={exit_summary['avg_layers_per_token']:.2f}, "
+                    f"layer_saving={exit_summary['layer_saving_ratio']:.3f}, "
+                    f"early_exit_rate={exit_summary['early_exit_rate']:.3f}"
+                )
             print('---------------')
