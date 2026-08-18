@@ -1,0 +1,2 @@
+confidence_bucket,count,avg_oracle_depth,avg_dynamic_exit_layer,oracle_early_rate,agreement_rate,avg_confidence
+0.8-1.0,65536,3.31817626953125,7.58819580078125,0.823577880859375,0.9993896484375,0.9977403269085698

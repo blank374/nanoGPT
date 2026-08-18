@@ -4,6 +4,8 @@ Phase 1.5 / Phase 2 analysis for Dynamic Fast/Slow Path models.
 Measures:
 - Oracle Required Depth:
   D*(t) = min layer where intermediate top-1 equals final top-1
+- Stable Oracle Required Depth:
+  D_stable(t) = min layer where this and all later measured layers equal final top-1
 - Top-1 agreement per exit layer
 - Confidence-bin agreement
 - Familiarity buckets using train-set unigram and bigram frequency
@@ -138,6 +140,17 @@ def add_bucket(summary, key, oracle_depth, dynamic_exit_layer, agreed, confidenc
     row["confidence_sum"] += confidence
 
 
+def add_stable_bucket(summary, key, stable_depth, bigram_freq):
+    row = summary.setdefault(key, {
+        "count": 0,
+        "stable_depth_sum": 0,
+        "bigram_freq_sum": 0,
+    })
+    row["count"] += 1
+    row["stable_depth_sum"] += stable_depth
+    row["bigram_freq_sum"] += bigram_freq
+
+
 def finalize_bucket_rows(summary, key_name):
     rows = []
     for key, row in sorted(summary.items()):
@@ -152,6 +165,49 @@ def finalize_bucket_rows(summary, key_name):
             "avg_confidence": row["confidence_sum"] / count,
         })
     return rows
+
+
+def finalize_stable_bucket_rows(summary, key_name):
+    rows = []
+    for key, row in sorted(summary.items()):
+        count = max(row["count"], 1)
+        rows.append({
+            key_name: key,
+            "count": row["count"],
+            "avg_stable_oracle_depth": row["stable_depth_sum"] / count,
+            "avg_bigram_frequency": row["bigram_freq_sum"] / count,
+        })
+    return rows
+
+
+def rankdata(values):
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(values):
+        j = i + 1
+        while j < len(values) and values[order[j]] == values[order[i]]:
+            j += 1
+        avg_rank = (i + j - 1) / 2.0
+        for k in range(i, j):
+            ranks[order[k]] = avg_rank
+        i = j
+    return ranks
+
+
+def spearman_corr(xs, ys):
+    if len(xs) < 2:
+        return 0.0
+    rx = rankdata(xs)
+    ry = rankdata(ys)
+    mean_x = sum(rx) / len(rx)
+    mean_y = sum(ry) / len(ry)
+    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(rx, ry))
+    den_x = sum((x - mean_x) ** 2 for x in rx) ** 0.5
+    den_y = sum((y - mean_y) ** 2 for y in ry) ** 0.5
+    if den_x == 0 or den_y == 0:
+        return 0.0
+    return num / (den_x * den_y)
 
 
 def write_csv(path, rows):
@@ -178,10 +234,15 @@ def main():
     ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype) if use_autocast else torch.no_grad()
 
     oracle_counts = {layer: 0 for layer in model.exit_layers + [model.config.n_layer]}
+    stable_oracle_counts = {layer: 0 for layer in model.exit_layers + [model.config.n_layer]}
     layer_agreement = {layer: [0, 0] for layer in model.exit_layers}
     confidence_summary = {}
     unigram_summary = {}
     bigram_summary = {}
+    stable_unigram_summary = {}
+    stable_bigram_summary = {}
+    log_bigram_freqs = []
+    stable_depths = []
     total = 0
 
     max_start = len(data) - args.block_size - 1
@@ -205,13 +266,16 @@ def main():
             for t in range(args.block_size):
                 final_pred = int(final_top1[b, t].item())
                 oracle_depth = model.config.n_layer
+                stable_oracle_depth = model.config.n_layer
                 dynamic_exit_layer = model.config.n_layer
                 confidence = 0.0
                 agreed_at_dynamic_layer = True
+                agreements = {}
 
                 for layer in model.exit_layers:
                     pred = int(exit_top1[layer][b, t].item())
                     agreed = pred == final_pred
+                    agreements[layer] = agreed
                     layer_agreement[layer][0] += int(agreed)
                     layer_agreement[layer][1] += 1
                     if agreed and oracle_depth == model.config.n_layer:
@@ -222,22 +286,34 @@ def main():
                         confidence = layer_confidence
                         agreed_at_dynamic_layer = agreed
 
+                for layer in model.exit_layers:
+                    later_layers = [later for later in model.exit_layers if later >= layer]
+                    if all(agreements[later] for later in later_layers):
+                        stable_oracle_depth = layer
+                        break
+
                 if dynamic_exit_layer == model.config.n_layer:
                     confidence = 1.0
                     agreed_at_dynamic_layer = True
 
                 oracle_counts[oracle_depth] += 1
+                stable_oracle_counts[stable_oracle_depth] += 1
                 total += 1
 
                 token_id = int(y_np[b, t])
                 prev_id = int(x_np[b, t])
+                bigram_freq = bigram[(prev_id, token_id)]
                 unigram_bucket = frequency_bucket(unigram[token_id])
-                bigram_bucket = frequency_bucket(bigram[(prev_id, token_id)])
+                bigram_bucket = frequency_bucket(bigram_freq)
                 conf_bucket = confidence_bucket(confidence)
 
                 add_bucket(confidence_summary, conf_bucket, oracle_depth, dynamic_exit_layer, agreed_at_dynamic_layer, confidence)
                 add_bucket(unigram_summary, unigram_bucket, oracle_depth, dynamic_exit_layer, agreed_at_dynamic_layer, confidence)
                 add_bucket(bigram_summary, bigram_bucket, oracle_depth, dynamic_exit_layer, agreed_at_dynamic_layer, confidence)
+                add_stable_bucket(stable_unigram_summary, unigram_bucket, stable_oracle_depth, bigram_freq)
+                add_stable_bucket(stable_bigram_summary, bigram_bucket, stable_oracle_depth, bigram_freq)
+                log_bigram_freqs.append(float(np.log(bigram_freq + 1)))
+                stable_depths.append(float(stable_oracle_depth))
 
     output_prefix = args.output_prefix or os.path.join(args.out_dir, os.path.splitext(args.checkpoint)[0])
     oracle_rows = [{
@@ -250,15 +326,32 @@ def main():
         "agreement_vs_final": agree / count if count else 0.0,
         "count": count,
     } for layer, (agree, count) in layer_agreement.items()]
+    stable_oracle_rows = [{
+        "layer": layer,
+        "count": count,
+        "rate": count / max(total, 1),
+    } for layer, count in stable_oracle_counts.items()]
+    correlation_rows = [{
+        "metric": "spearman_corr_log_bigram_freq_stable_depth",
+        "value": spearman_corr(log_bigram_freqs, stable_depths),
+        "count": len(stable_depths),
+    }]
 
     write_csv(f"{output_prefix}_oracle_depth.csv", oracle_rows)
+    write_csv(f"{output_prefix}_stable_oracle_depth.csv", stable_oracle_rows)
     write_csv(f"{output_prefix}_layer_agreement.csv", agreement_rows)
+    write_csv(f"{output_prefix}_spearman.csv", correlation_rows)
     write_csv(f"{output_prefix}_confidence_buckets.csv", finalize_bucket_rows(confidence_summary, "confidence_bucket"))
     write_csv(f"{output_prefix}_unigram_familiarity.csv", finalize_bucket_rows(unigram_summary, "unigram_bucket"))
     write_csv(f"{output_prefix}_bigram_familiarity.csv", finalize_bucket_rows(bigram_summary, "bigram_bucket"))
+    write_csv(f"{output_prefix}_stable_unigram_familiarity.csv", finalize_stable_bucket_rows(stable_unigram_summary, "unigram_bucket"))
+    write_csv(f"{output_prefix}_stable_bigram_familiarity.csv", finalize_stable_bucket_rows(stable_bigram_summary, "bigram_bucket"))
 
     print("===== Oracle Required Depth =====")
     for row in oracle_rows:
+        print(f"Layer {row['layer']}: {100 * row['rate']:.2f}% ({row['count']})")
+    print("\n===== Stable Oracle Required Depth =====")
+    for row in stable_oracle_rows:
         print(f"Layer {row['layer']}: {100 * row['rate']:.2f}% ({row['count']})")
     print("\n===== Layer Agreement =====")
     for row in agreement_rows:
@@ -269,6 +362,11 @@ def main():
     print("\n===== Bigram Familiarity =====")
     for row in finalize_bucket_rows(bigram_summary, "bigram_bucket"):
         print(f"{row['bigram_bucket']}: avg_oracle_depth={row['avg_oracle_depth']:.2f}, oracle_early_rate={100 * row['oracle_early_rate']:.2f}%, count={row['count']}")
+    print("\n===== Stable Bigram Familiarity =====")
+    for row in finalize_stable_bucket_rows(stable_bigram_summary, "bigram_bucket"):
+        print(f"{row['bigram_bucket']}: avg_stable_oracle_depth={row['avg_stable_oracle_depth']:.2f}, count={row['count']}")
+    print("\n===== Spearman =====")
+    print(f"corr(log(bigram_freq+1), stable_depth) = {correlation_rows[0]['value']:.4f}")
     print(f"\nwrote CSV files with prefix {output_prefix}_*.csv")
 
 

@@ -1,0 +1,4 @@
+unigram_bucket,count,avg_oracle_depth,avg_dynamic_exit_layer,oracle_early_rate,agreement_rate,avg_confidence
+high,8687,6.336364682859445,8.0,0.4690917462875561,1.0,1.0
+medium,164,5.865853658536586,8.0,0.5121951219512195,1.0,1.0
+very_high,56685,5.154026638440505,8.0,0.6771279880038811,1.0,1.0
