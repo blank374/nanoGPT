@@ -1,0 +1,2 @@
+run,checkpoint,iter,final_ce,perplexity,mean_effective_width,effective_width_ratio,width64,width128,width256,width512
+A_dense,ckpt_iter_3000.pt,3000,1.7389932572841644,5.691610549929743,512.0,1.0,0.0,0.0,0.0,1.0

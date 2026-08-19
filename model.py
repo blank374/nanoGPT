@@ -91,18 +91,176 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class FastSlowMLP(nn.Module):
+    """
+    Logically sparse MLP: a small dense fast path plus a larger routed slow path.
+
+    Training keeps the slow path differentiable with a soft sigmoid gate. Eval can
+    switch to hard token routing so the slow branch is only run for selected tokens.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        fast_hidden = max(1, int(config.dynamic_mlp_fast_ratio * config.n_embd))
+        slow_hidden = max(1, int(config.dynamic_mlp_slow_ratio * config.n_embd))
+        self.fast_fc = nn.Linear(config.n_embd, fast_hidden, bias=config.bias)
+        self.fast_proj = nn.Linear(fast_hidden, config.n_embd, bias=config.bias)
+        self.slow_fc = nn.Linear(config.n_embd, slow_hidden, bias=config.bias)
+        self.slow_proj = nn.Linear(slow_hidden, config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(config.dropout)
+        self.router_hidden = nn.Linear(config.n_embd, 1, bias=config.bias)
+        self.router_features = nn.Linear(3, 1, bias=False)
+        self.hard_eval = config.dynamic_mlp_hard_eval
+        self.threshold = config.dynamic_mlp_threshold
+        self.last_gate = None
+        self.last_hard_mask = None
+
+    def _slow_path(self, x):
+        x = self.slow_fc(x)
+        x = self.gelu(x)
+        x = self.slow_proj(x)
+        return self.dropout(x)
+
+    def forward(self, x, residual_delta=None):
+        fast = self.fast_fc(x)
+        fast = self.gelu(fast)
+        fast = self.fast_proj(fast)
+        fast = self.dropout(fast)
+
+        with torch.no_grad():
+            hidden_norm = x.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
+            if residual_delta is None:
+                delta_norm = torch.zeros_like(hidden_norm)
+            else:
+                delta_norm = residual_delta.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
+            relative_change = delta_norm / hidden_norm.clamp_min(1e-6)
+            router_features = torch.cat([hidden_norm, delta_norm, relative_change], dim=-1).to(x.dtype)
+        gate_logits = self.router_hidden(x) + self.router_features(router_features)
+        gate = torch.sigmoid(gate_logits)
+
+        if self.hard_eval and not self.training:
+            hard_mask = gate.squeeze(-1) >= self.threshold
+            slow = torch.zeros_like(x)
+            if hard_mask.any():
+                slow_tokens = self._slow_path(x[hard_mask])
+                slow[hard_mask] = slow_tokens
+            self.last_hard_mask = hard_mask.detach()
+            out = fast + slow
+        else:
+            slow = self._slow_path(x)
+            self.last_hard_mask = None
+            out = fast + gate.to(slow.dtype) * slow
+
+        self.last_gate = gate.detach()
+        return out
+
+class WidthRouter(nn.Module):
+
+    def __init__(self, config, num_widths):
+        super().__init__()
+        self.proj = nn.Linear(config.n_embd, num_widths, bias=config.bias)
+
+    def forward(self, x):
+        return self.proj(x)
+
+class AdaptiveWidthMLP(nn.Module):
+    """
+    Nested-width MLP.
+
+    The full 4*d hidden tensor is always materialized in this prototype, but a
+    per-token channel mask makes smaller widths true prefixes of larger widths.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.max_hidden = 4 * config.n_embd
+        width_choices = sorted(set(max(1, min(self.max_hidden, int(ratio * config.n_embd)))
+                                   for ratio in config.dynamic_width_ratios))
+        assert width_choices, "dynamic_width_ratios must produce at least one width"
+        assert width_choices[-1] == self.max_hidden, \
+            f"dynamic_width_ratios must include max width {self.max_hidden}"
+        self.width_choices = width_choices
+        self.c_fc = nn.Linear(config.n_embd, self.max_hidden, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(self.max_hidden, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        self.router = WidthRouter(config, len(width_choices))
+        self.temperature = config.dynamic_width_temperature
+        self.hard_eval = config.dynamic_width_hard_eval
+        masks = torch.zeros(len(width_choices), self.max_hidden)
+        for i, width in enumerate(width_choices):
+            masks[i, :width] = 1.0
+        costs = torch.tensor([width / self.max_hidden for width in width_choices], dtype=torch.float32)
+        widths = torch.tensor(width_choices, dtype=torch.float32)
+        self.register_buffer("width_masks", masks)
+        self.register_buffer("width_costs", costs)
+        self.register_buffer("width_values", widths)
+        self.force_width_index = None
+        self.last_width_probs = None
+        self.last_selected_width_idx = None
+        self.last_expected_cost = None
+        self.last_effective_width = None
+        self.last_router_entropy = None
+
+    def forward(self, x):
+        router_logits = self.router(x)
+        probs = F.softmax(router_logits / self.temperature, dim=-1)
+
+        if self.force_width_index is not None:
+            selected = torch.full(x.shape[:2], int(self.force_width_index), dtype=torch.long, device=x.device)
+            mask = self.width_masks[selected].to(x.dtype)
+            expected_cost = self.width_costs[selected].to(x.dtype)
+            effective_width = self.width_values[selected].to(x.dtype)
+        elif self.hard_eval and not self.training:
+            selected = probs.argmax(dim=-1)
+            mask = self.width_masks[selected].to(x.dtype)
+            expected_cost = self.width_costs[selected].to(x.dtype)
+            effective_width = self.width_values[selected].to(x.dtype)
+        else:
+            selected = probs.argmax(dim=-1)
+            mask = torch.matmul(probs, self.width_masks.to(probs.dtype)).to(x.dtype)
+            expected_cost = torch.matmul(probs, self.width_costs.to(probs.dtype))
+            effective_width = torch.matmul(probs, self.width_values.to(probs.dtype)).to(x.dtype)
+
+        hidden = self.c_fc(x)
+        hidden = self.gelu(hidden)
+        hidden = hidden * mask
+        x = self.c_proj(hidden)
+        x = self.dropout(x)
+
+        entropy = -(probs.float() * torch.log(probs.float().clamp_min(1e-9))).sum(dim=-1)
+        self.last_width_probs = probs
+        self.last_selected_width_idx = selected.detach()
+        self.last_expected_cost = expected_cost
+        self.last_effective_width = effective_width.detach()
+        self.last_router_entropy = entropy
+        return x
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        assert not (config.dynamic_mlp and config.dynamic_width), "dynamic_mlp and dynamic_width are mutually exclusive"
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.dynamic_mlp = config.dynamic_mlp
+        self.dynamic_width = config.dynamic_width
+        if config.dynamic_mlp:
+            self.mlp = FastSlowMLP(config)
+        elif config.dynamic_width:
+            self.mlp = AdaptiveWidthMLP(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        attn_delta = self.attn(self.ln_1(x))
+        x = x + attn_delta
+        if self.dynamic_mlp:
+            x = x + self.mlp(self.ln_2(x), residual_delta=attn_delta)
+        else:
+            x = x + self.mlp(self.ln_2(x))
         return x
 
 class EarlyExitHead(nn.Module):
@@ -140,6 +298,18 @@ class GPTConfig:
     use_distillation: bool = False
     distillation_temperature: float = 2.0
     distillation_beta: float = 0.5
+    dynamic_mlp: bool = False
+    dynamic_mlp_fast_ratio: float = 1.0
+    dynamic_mlp_slow_ratio: float = 3.0
+    dynamic_mlp_cost_weight: float = 0.01
+    dynamic_mlp_threshold: float = 0.5
+    dynamic_mlp_hard_eval: bool = True
+    dynamic_width: bool = False
+    dynamic_width_ratios: list = None
+    dynamic_width_cost_weight: float = 0.01
+    dynamic_width_hard_eval: bool = True
+    dynamic_width_temperature: float = 1.0
+    dynamic_width_entropy_weight: float = 0.0
 
 class GPT(nn.Module):
 
@@ -147,6 +317,9 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        assert not (config.dynamic_mlp and config.dynamic_width), "dynamic_mlp and dynamic_width are mutually exclusive"
+        if config.dynamic_width_ratios is None:
+            config.dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -157,13 +330,16 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.exit_layers = self._normalize_exit_layers(config.exit_layers)
+        self.exit_layers = self._normalize_exit_layers(config.exit_layers) if config.dynamic_exit else []
         self.exit_heads = nn.ModuleDict()
         if config.dynamic_exit:
             for layer_idx in self.exit_layers:
                 self.exit_heads[str(layer_idx)] = EarlyExitHead(config)
         self.last_exit_stats = None
         self.last_exit_details = None
+        self.last_dynamic_mlp_stats = None
+        self.last_dynamic_width_stats = None
+        self.last_loss_stats = None
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -176,13 +352,28 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
+            if pn.endswith(('c_proj.weight', 'fast_proj.weight', 'slow_proj.weight')):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
         if config.dynamic_exit:
             print(f"dynamic exit enabled at layers: {self.exit_layers}")
+        if config.dynamic_mlp:
+            print(
+                "dynamic MLP enabled: "
+                f"fast={config.dynamic_mlp_fast_ratio:.2f}x, "
+                f"slow={config.dynamic_mlp_slow_ratio:.2f}x, "
+                f"cost_weight={config.dynamic_mlp_cost_weight}"
+            )
+        if config.dynamic_width:
+            width_choices = sorted(set(max(1, min(4 * config.n_embd, int(ratio * config.n_embd)))
+                                       for ratio in config.dynamic_width_ratios))
+            print(
+                "dynamic width enabled: "
+                f"widths={width_choices}, "
+                f"cost_weight={config.dynamic_width_cost_weight}"
+            )
 
     def _normalize_exit_layers(self, exit_layers):
         if exit_layers is None:
@@ -238,6 +429,136 @@ class GPT(nn.Module):
             }
         else:
             self.last_exit_stats = None
+
+    def _dynamic_mlp_gates(self):
+        gates = []
+        hard_masks = []
+        for block in self.transformer.h:
+            mlp = block.mlp
+            if isinstance(mlp, FastSlowMLP) and mlp.last_gate is not None:
+                gates.append(mlp.last_gate)
+                if mlp.last_hard_mask is not None:
+                    hard_masks.append(mlp.last_hard_mask)
+        return gates, hard_masks
+
+    def _set_dynamic_mlp_stats(self, gates, hard_masks=None, valid_mask=None):
+        if not gates:
+            self.last_dynamic_mlp_stats = None
+            return
+        gate_tensor = torch.stack(gates)
+        if valid_mask is not None:
+            valid = valid_mask.unsqueeze(0).unsqueeze(-1)
+            gate_values = gate_tensor[valid.expand_as(gate_tensor)]
+        else:
+            gate_values = gate_tensor.reshape(-1)
+        stats = {
+            "mean_gate": gate_values.float().mean().item(),
+            "slow_soft_fraction": (gate_values.float() >= self.config.dynamic_mlp_threshold).float().mean().item(),
+        }
+        if hard_masks:
+            hard_tensor = torch.stack([mask.float() for mask in hard_masks])
+            stats["slow_hard_fraction"] = hard_tensor.mean().item()
+        self.last_dynamic_mlp_stats = stats
+
+    def _dynamic_mlp_cost_loss(self, gates, valid_mask):
+        if not gates:
+            return None
+        gate_tensor = torch.stack(gates)
+        if valid_mask is not None:
+            valid = valid_mask.unsqueeze(0).unsqueeze(-1)
+            return gate_tensor[valid.expand_as(gate_tensor)].float().mean()
+        return gate_tensor.float().mean()
+
+    def _dynamic_width_modules(self):
+        modules = []
+        for layer_idx, block in enumerate(self.transformer.h, start=1):
+            if isinstance(block.mlp, AdaptiveWidthMLP) and block.mlp.last_width_probs is not None:
+                modules.append((layer_idx, block.mlp))
+        return modules
+
+    def _dynamic_width_loss_terms(self, modules, valid_mask):
+        if not modules:
+            return None, None
+        costs = torch.stack([mlp.last_expected_cost for _, mlp in modules])
+        entropies = torch.stack([mlp.last_router_entropy for _, mlp in modules])
+        if valid_mask is not None:
+            valid = valid_mask.unsqueeze(0)
+            costs = costs[valid.expand_as(costs)]
+            entropies = entropies[valid.expand_as(entropies)]
+        return costs.float().mean(), entropies.float().mean()
+
+    def _set_dynamic_width_stats(self, modules, valid_mask=None):
+        if not modules:
+            self.last_dynamic_width_stats = None
+            return
+        width_values = modules[0][1].width_values.float()
+        max_width = float(modules[0][1].max_hidden)
+        layer_stats = []
+        all_probs = []
+        all_selected = []
+        all_expected_width = []
+        all_entropy = []
+
+        for layer_idx, mlp in modules:
+            probs = mlp.last_width_probs.detach().float()
+            selected = mlp.last_selected_width_idx.detach()
+            entropy = mlp.last_router_entropy.detach().float()
+            effective_width = mlp.last_effective_width.detach().float()
+            if valid_mask is not None:
+                probs_values = probs[valid_mask]
+                selected_values = selected[valid_mask]
+                entropy_values = entropy[valid_mask]
+                effective_width_values = effective_width[valid_mask]
+            else:
+                probs_values = probs.reshape(-1, probs.size(-1))
+                selected_values = selected.reshape(-1)
+                entropy_values = entropy.reshape(-1)
+                effective_width_values = effective_width.reshape(-1)
+            fractions = torch.bincount(selected_values, minlength=len(mlp.width_choices)).float()
+            fractions = fractions / fractions.sum().clamp_min(1.0)
+            prob_means = probs_values.mean(dim=0)
+            layer_stats.append({
+                "layer": layer_idx,
+                "mean_effective_width": effective_width_values.mean().item(),
+                "mean_width_ratio": (effective_width_values.mean() / max_width).item(),
+                "router_entropy": entropy_values.mean().item(),
+                "width_fractions": {
+                    str(width): fractions[i].item()
+                    for i, width in enumerate(mlp.width_choices)
+                },
+                "width_prob_means": {
+                    str(width): prob_means[i].item()
+                    for i, width in enumerate(mlp.width_choices)
+                },
+            })
+            all_probs.append(probs_values)
+            all_selected.append(selected_values)
+            all_expected_width.append(effective_width_values)
+            all_entropy.append(entropy_values)
+
+        probs_cat = torch.cat(all_probs)
+        selected_cat = torch.cat(all_selected)
+        expected_width_cat = torch.cat(all_expected_width)
+        entropy_cat = torch.cat(all_entropy)
+        fractions = torch.bincount(selected_cat, minlength=len(width_values)).float()
+        fractions = fractions / fractions.sum().clamp_min(1.0)
+        prob_means = probs_cat.mean(dim=0)
+        self.last_dynamic_width_stats = {
+            "width_choices": [int(v.item()) for v in width_values],
+            "max_width": max_width,
+            "mean_effective_width": expected_width_cat.mean().item(),
+            "mean_width_ratio": (expected_width_cat.mean() / max_width).item(),
+            "router_entropy": entropy_cat.mean().item(),
+            "width_fractions": {
+                str(int(width_values[i].item())): fractions[i].item()
+                for i in range(len(width_values))
+            },
+            "width_prob_means": {
+                str(int(width_values[i].item())): prob_means[i].item()
+                for i in range(len(width_values))
+            },
+            "layers": layer_stats,
+        }
 
     def _forward_dynamic_inference(self, idx, pos):
         tok_emb = self.transformer.wte(idx)
@@ -306,6 +627,9 @@ class GPT(nn.Module):
                 "max_prob": exit_max_prob.detach(),
                 "entropy": exit_entropy.detach(),
             }
+            gates, hard_masks = self._dynamic_mlp_gates()
+            self._set_dynamic_mlp_stats(gates, hard_masks)
+            self._set_dynamic_width_stats(self._dynamic_width_modules())
 
         return final_logits, None
 
@@ -333,7 +657,8 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            task_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = task_loss
             aux_losses = []
             if self.config.dynamic_exit and exit_outputs:
                 for _, exit_logits in exit_outputs:
@@ -354,12 +679,38 @@ class GPT(nn.Module):
             if self.config.dynamic_exit and aux_losses:
                 loss = loss + self.config.early_exit_loss_weight * torch.stack(aux_losses).mean()
             self._set_training_exit_stats(aux_losses)
+            gates, hard_masks = self._dynamic_mlp_gates()
+            dynamic_mlp_cost = self._dynamic_mlp_cost_loss(gates, targets != -1)
+            if dynamic_mlp_cost is not None:
+                loss = loss + self.config.dynamic_mlp_cost_weight * dynamic_mlp_cost
+            self._set_dynamic_mlp_stats(gates, hard_masks, valid_mask=targets != -1)
+            width_modules = self._dynamic_width_modules()
+            dynamic_width_cost, dynamic_width_entropy = self._dynamic_width_loss_terms(width_modules, targets != -1)
+            if dynamic_width_cost is not None:
+                loss = loss + self.config.dynamic_width_cost_weight * dynamic_width_cost
+            if dynamic_width_entropy is not None and self.config.dynamic_width_entropy_weight != 0.0:
+                loss = loss - self.config.dynamic_width_entropy_weight * dynamic_width_entropy
+            self._set_dynamic_width_stats(width_modules, valid_mask=targets != -1)
+            self.last_loss_stats = {
+                "task_loss": task_loss.detach().item(),
+                "total_loss": loss.detach().item(),
+            }
+            if dynamic_mlp_cost is not None:
+                self.last_loss_stats["dynamic_mlp_cost"] = dynamic_mlp_cost.detach().item()
+            if dynamic_width_cost is not None:
+                self.last_loss_stats["dynamic_width_cost"] = dynamic_width_cost.detach().item()
+            if dynamic_width_entropy is not None:
+                self.last_loss_stats["dynamic_width_entropy"] = dynamic_width_entropy.detach().item()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
             self.last_exit_stats = None
             self.last_exit_details = None
+            self.last_loss_stats = None
+            gates, hard_masks = self._dynamic_mlp_gates()
+            self._set_dynamic_mlp_stats(gates, hard_masks)
+            self._set_dynamic_width_stats(self._dynamic_width_modules())
 
         return logits, loss
 

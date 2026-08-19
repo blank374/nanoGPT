@@ -65,6 +65,20 @@ early_exit_loss_weight = 0.3
 use_distillation = False
 distillation_temperature = 2.0
 distillation_beta = 0.5
+# dynamic MLP capacity routing
+dynamic_mlp = False
+dynamic_mlp_fast_ratio = 1.0
+dynamic_mlp_slow_ratio = 3.0
+dynamic_mlp_cost_weight = 0.01
+dynamic_mlp_threshold = 0.5
+dynamic_mlp_hard_eval = True
+# nested dynamic MLP width routing
+dynamic_width = False
+dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
+dynamic_width_cost_weight = 0.01
+dynamic_width_hard_eval = True
+dynamic_width_temperature = 1.0
+dynamic_width_entropy_weight = 0.0
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -164,7 +178,19 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   early_exit_loss_weight=early_exit_loss_weight,
                   use_distillation=use_distillation,
                   distillation_temperature=distillation_temperature,
-                  distillation_beta=distillation_beta) # start with model_args from command line
+                  distillation_beta=distillation_beta,
+                  dynamic_mlp=dynamic_mlp,
+                  dynamic_mlp_fast_ratio=dynamic_mlp_fast_ratio,
+                  dynamic_mlp_slow_ratio=dynamic_mlp_slow_ratio,
+                  dynamic_mlp_cost_weight=dynamic_mlp_cost_weight,
+                  dynamic_mlp_threshold=dynamic_mlp_threshold,
+                  dynamic_mlp_hard_eval=dynamic_mlp_hard_eval,
+                  dynamic_width=dynamic_width,
+                  dynamic_width_ratios=dynamic_width_ratios,
+                  dynamic_width_cost_weight=dynamic_width_cost_weight,
+                  dynamic_width_hard_eval=dynamic_width_hard_eval,
+                  dynamic_width_temperature=dynamic_width_temperature,
+                  dynamic_width_entropy_weight=dynamic_width_entropy_weight) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -188,7 +214,12 @@ elif init_from == 'resume':
     # command-line/default values so they can still be resumed unchanged.
     for k in ['dynamic_exit', 'exit_layers', 'confidence_method', 'confidence_threshold',
               'entropy_threshold', 'early_exit_loss_weight', 'use_distillation',
-              'distillation_temperature', 'distillation_beta']:
+              'distillation_temperature', 'distillation_beta', 'dynamic_mlp',
+              'dynamic_mlp_fast_ratio', 'dynamic_mlp_slow_ratio',
+              'dynamic_mlp_cost_weight', 'dynamic_mlp_threshold',
+              'dynamic_mlp_hard_eval', 'dynamic_width', 'dynamic_width_ratios',
+              'dynamic_width_cost_weight', 'dynamic_width_hard_eval',
+              'dynamic_width_temperature', 'dynamic_width_entropy_weight']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -296,14 +327,43 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        width_stats = raw_model.last_dynamic_width_stats
+        if width_stats is not None:
+            dist = ", ".join(
+                f"w{width}={width_stats['width_fractions'][str(width)]:.3f}"
+                for width in width_stats["width_choices"]
+            )
+            print(
+                f"  eval_dynamic_width: mean_width {width_stats['mean_effective_width']:.2f} "
+                f"({100 * width_stats['mean_width_ratio']:.2f}%), "
+                f"entropy {width_stats['router_entropy']:.4f}, {dist}"
+            )
+            for layer in width_stats["layers"]:
+                layer_dist = ", ".join(
+                    f"w{width}={layer['width_fractions'][str(width)]:.3f}"
+                    for width in width_stats["width_choices"]
+                )
+                print(
+                    f"    eval layer {layer['layer']}: mean_width {layer['mean_effective_width']:.2f}, "
+                    f"entropy {layer['router_entropy']:.4f}, {layer_dist}"
+                )
         if wandb_log:
-            wandb.log({
+            wandb_metrics = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            if width_stats is not None:
+                wandb_metrics.update({
+                    "dynamic_width/mean_effective_width": width_stats["mean_effective_width"],
+                    "dynamic_width/mean_width_ratio": width_stats["mean_width_ratio"],
+                    "dynamic_width/router_entropy": width_stats["router_entropy"],
+                })
+                for width in width_stats["width_choices"]:
+                    wandb_metrics[f"dynamic_width/width{width}_fraction"] = width_stats["width_fractions"][str(width)]
+            wandb.log(wandb_metrics)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -360,6 +420,39 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        mlp_stats = raw_model.last_dynamic_mlp_stats
+        if mlp_stats is not None:
+            print(
+                f"  dynamic_mlp: mean_gate {mlp_stats['mean_gate']:.4f}, "
+                f"slow_soft_fraction {mlp_stats['slow_soft_fraction']:.4f}"
+            )
+        width_stats = raw_model.last_dynamic_width_stats
+        if width_stats is not None:
+            loss_stats = raw_model.last_loss_stats or {}
+            dist = ", ".join(
+                f"w{width}={width_stats['width_fractions'][str(width)]:.3f}"
+                for width in width_stats["width_choices"]
+            )
+            print(
+                f"  dynamic_width: mean_width {width_stats['mean_effective_width']:.2f} "
+                f"({100 * width_stats['mean_width_ratio']:.2f}%), "
+                f"entropy {width_stats['router_entropy']:.4f}, {dist}"
+            )
+            if loss_stats:
+                print(
+                    f"  losses: task_ce {loss_stats.get('task_loss', 0.0):.4f}, "
+                    f"width_cost {loss_stats.get('dynamic_width_cost', 0.0):.4f}, "
+                    f"total {loss_stats.get('total_loss', lossf):.4f}"
+                )
+            for layer in width_stats["layers"]:
+                layer_dist = ", ".join(
+                    f"w{width}={layer['width_fractions'][str(width)]:.3f}"
+                    for width in width_stats["width_choices"]
+                )
+                print(
+                    f"    layer {layer['layer']}: mean_width {layer['mean_effective_width']:.2f}, "
+                    f"entropy {layer['router_entropy']:.4f}, {layer_dist}"
+                )
     iter_num += 1
     local_iter_num += 1
 
