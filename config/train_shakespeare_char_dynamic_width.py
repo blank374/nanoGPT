@@ -30,6 +30,10 @@ dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
 dynamic_width_cost_weight = 0.01
 dynamic_width_hard_eval = True
 dynamic_width_temperature = 1.0
+dynamic_width_temperature_final = 1.0
+dynamic_width_temperature_anneal_iters = 0
+dynamic_width_routing = "soft"
+dynamic_width_hard_loss_weight = 0.0
 dynamic_width_entropy_weight = 0.0
 
 learning_rate = 1e-3

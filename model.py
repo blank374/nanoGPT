@@ -188,6 +188,8 @@ class AdaptiveWidthMLP(nn.Module):
         self.router = WidthRouter(config, len(width_choices))
         self.temperature = config.dynamic_width_temperature
         self.hard_eval = config.dynamic_width_hard_eval
+        self.routing = config.dynamic_width_routing
+        self.force_hard = False
         masks = torch.zeros(len(width_choices), self.max_hidden)
         for i, width in enumerate(width_choices):
             masks[i, :width] = 1.0
@@ -212,14 +214,20 @@ class AdaptiveWidthMLP(nn.Module):
             mask = self.width_masks[selected].to(x.dtype)
             expected_cost = self.width_costs[selected].to(x.dtype)
             effective_width = self.width_values[selected].to(x.dtype)
-        elif self.hard_eval and not self.training:
+        elif self.force_hard or (self.hard_eval and not self.training):
             selected = probs.argmax(dim=-1)
             mask = self.width_masks[selected].to(x.dtype)
             expected_cost = self.width_costs[selected].to(x.dtype)
             effective_width = self.width_values[selected].to(x.dtype)
         else:
             selected = probs.argmax(dim=-1)
-            mask = torch.matmul(probs, self.width_masks.to(probs.dtype)).to(x.dtype)
+            soft_mask = torch.matmul(probs, self.width_masks.to(probs.dtype))
+            if self.training and self.routing == "ste":
+                hard_mask = self.width_masks[selected].to(probs.dtype)
+                mask = hard_mask + soft_mask - soft_mask.detach()
+            else:
+                mask = soft_mask
+            mask = mask.to(x.dtype)
             expected_cost = torch.matmul(probs, self.width_costs.to(probs.dtype))
             effective_width = torch.matmul(probs, self.width_values.to(probs.dtype)).to(x.dtype)
 
@@ -309,6 +317,10 @@ class GPTConfig:
     dynamic_width_cost_weight: float = 0.01
     dynamic_width_hard_eval: bool = True
     dynamic_width_temperature: float = 1.0
+    dynamic_width_temperature_final: float = 1.0
+    dynamic_width_temperature_anneal_iters: int = 0
+    dynamic_width_routing: str = "soft" # "soft" or "ste"
+    dynamic_width_hard_loss_weight: float = 0.0
     dynamic_width_entropy_weight: float = 0.0
 
 class GPT(nn.Module):
@@ -320,6 +332,7 @@ class GPT(nn.Module):
         assert not (config.dynamic_mlp and config.dynamic_width), "dynamic_mlp and dynamic_width are mutually exclusive"
         if config.dynamic_width_ratios is None:
             config.dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
+        assert config.dynamic_width_routing in ("soft", "ste"), "dynamic_width_routing must be 'soft' or 'ste'"
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -475,6 +488,50 @@ class GPT(nn.Module):
             if isinstance(block.mlp, AdaptiveWidthMLP) and block.mlp.last_width_probs is not None:
                 modules.append((layer_idx, block.mlp))
         return modules
+
+    def set_dynamic_width_temperature(self, temperature):
+        if not self.config.dynamic_width:
+            return
+        self.config.dynamic_width_temperature = temperature
+        for block in self.transformer.h:
+            if isinstance(block.mlp, AdaptiveWidthMLP):
+                block.mlp.temperature = temperature
+
+    def _set_dynamic_width_force_hard(self, force_hard):
+        for block in self.transformer.h:
+            if isinstance(block.mlp, AdaptiveWidthMLP):
+                block.mlp.force_hard = force_hard
+
+    def _forward_logits(self, idx, targets=None, force_hard_width=False):
+        old_force = []
+        if force_hard_width:
+            for block in self.transformer.h:
+                if isinstance(block.mlp, AdaptiveWidthMLP):
+                    old_force.append((block.mlp, block.mlp.force_hard))
+                    block.mlp.force_hard = True
+        try:
+            device = idx.device
+            b, t = idx.size()
+            assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
+            tok_emb = self.transformer.wte(idx)
+            pos_emb = self.transformer.wpe(pos)
+            x = self.transformer.drop(tok_emb + pos_emb)
+            exit_outputs = []
+            for layer_idx, block in enumerate(self.transformer.h, start=1):
+                x = block(x)
+                if self.config.dynamic_exit and targets is not None and layer_idx in self.exit_layers:
+                    exit_logits = self.exit_heads[str(layer_idx)](x)
+                    exit_outputs.append((layer_idx, exit_logits))
+            x = self.transformer.ln_f(x)
+            if targets is not None:
+                logits = self.lm_head(x)
+            else:
+                logits = self.lm_head(x[:, [-1], :])
+            return logits, exit_outputs
+        finally:
+            for mlp, force in old_force:
+                mlp.force_hard = force
 
     def _dynamic_width_loss_terms(self, modules, valid_mask):
         if not modules:
@@ -642,21 +699,10 @@ class GPT(nn.Module):
         if self.config.dynamic_exit and targets is None and not self.training:
             return self._forward_dynamic_inference(idx, pos)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        exit_outputs = []
-        for layer_idx, block in enumerate(self.transformer.h, start=1):
-            x = block(x)
-            if self.config.dynamic_exit and targets is not None and layer_idx in self.exit_layers:
-                exit_logits = self.exit_heads[str(layer_idx)](x)
-                exit_outputs.append((layer_idx, exit_logits))
-        x = self.transformer.ln_f(x)
+        logits, exit_outputs = self._forward_logits(idx, targets)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
             task_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             loss = task_loss
             aux_losses = []
@@ -690,6 +736,15 @@ class GPT(nn.Module):
                 loss = loss + self.config.dynamic_width_cost_weight * dynamic_width_cost
             if dynamic_width_entropy is not None and self.config.dynamic_width_entropy_weight != 0.0:
                 loss = loss - self.config.dynamic_width_entropy_weight * dynamic_width_entropy
+            dynamic_width_hard_loss = None
+            if width_modules and self.config.dynamic_width_hard_loss_weight != 0.0:
+                hard_logits, _ = self._forward_logits(idx, targets, force_hard_width=True)
+                dynamic_width_hard_loss = F.cross_entropy(
+                    hard_logits.view(-1, hard_logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1,
+                )
+                loss = loss + self.config.dynamic_width_hard_loss_weight * dynamic_width_hard_loss
             self._set_dynamic_width_stats(width_modules, valid_mask=targets != -1)
             self.last_loss_stats = {
                 "task_loss": task_loss.detach().item(),
@@ -701,9 +756,10 @@ class GPT(nn.Module):
                 self.last_loss_stats["dynamic_width_cost"] = dynamic_width_cost.detach().item()
             if dynamic_width_entropy is not None:
                 self.last_loss_stats["dynamic_width_entropy"] = dynamic_width_entropy.detach().item()
+            if dynamic_width_hard_loss is not None:
+                self.last_loss_stats["dynamic_width_hard_loss"] = dynamic_width_hard_loss.detach().item()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
             self.last_exit_stats = None
             self.last_exit_details = None

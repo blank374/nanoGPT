@@ -78,6 +78,10 @@ dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
 dynamic_width_cost_weight = 0.01
 dynamic_width_hard_eval = True
 dynamic_width_temperature = 1.0
+dynamic_width_temperature_final = 1.0
+dynamic_width_temperature_anneal_iters = 0
+dynamic_width_routing = "soft" # "soft" or "ste"
+dynamic_width_hard_loss_weight = 0.0
 dynamic_width_entropy_weight = 0.0
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -190,6 +194,10 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   dynamic_width_cost_weight=dynamic_width_cost_weight,
                   dynamic_width_hard_eval=dynamic_width_hard_eval,
                   dynamic_width_temperature=dynamic_width_temperature,
+                  dynamic_width_temperature_final=dynamic_width_temperature_final,
+                  dynamic_width_temperature_anneal_iters=dynamic_width_temperature_anneal_iters,
+                  dynamic_width_routing=dynamic_width_routing,
+                  dynamic_width_hard_loss_weight=dynamic_width_hard_loss_weight,
                   dynamic_width_entropy_weight=dynamic_width_entropy_weight) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -219,7 +227,9 @@ elif init_from == 'resume':
               'dynamic_mlp_cost_weight', 'dynamic_mlp_threshold',
               'dynamic_mlp_hard_eval', 'dynamic_width', 'dynamic_width_ratios',
               'dynamic_width_cost_weight', 'dynamic_width_hard_eval',
-              'dynamic_width_temperature', 'dynamic_width_entropy_weight']:
+              'dynamic_width_temperature', 'dynamic_width_temperature_final',
+              'dynamic_width_temperature_anneal_iters', 'dynamic_width_routing',
+              'dynamic_width_hard_loss_weight', 'dynamic_width_entropy_weight']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -305,6 +315,12 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+def get_dynamic_width_temperature(it):
+    if not dynamic_width or dynamic_width_temperature_anneal_iters <= 0:
+        return dynamic_width_temperature
+    ratio = min(max(it / dynamic_width_temperature_anneal_iters, 0.0), 1.0)
+    return dynamic_width_temperature + ratio * (dynamic_width_temperature_final - dynamic_width_temperature)
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -322,6 +338,8 @@ while True:
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+    if dynamic_width:
+        raw_model.set_dynamic_width_temperature(get_dynamic_width_temperature(iter_num))
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -360,6 +378,7 @@ while True:
                     "dynamic_width/mean_effective_width": width_stats["mean_effective_width"],
                     "dynamic_width/mean_width_ratio": width_stats["mean_width_ratio"],
                     "dynamic_width/router_entropy": width_stats["router_entropy"],
+                    "dynamic_width/temperature": raw_model.config.dynamic_width_temperature,
                 })
                 for width in width_stats["width_choices"]:
                     wandb_metrics[f"dynamic_width/width{width}_fraction"] = width_stats["width_fractions"][str(width)]
@@ -367,6 +386,8 @@ while True:
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
+                if dynamic_width:
+                    model_args['dynamic_width_temperature'] = raw_model.config.dynamic_width_temperature
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -442,6 +463,7 @@ while True:
                 print(
                     f"  losses: task_ce {loss_stats.get('task_loss', 0.0):.4f}, "
                     f"width_cost {loss_stats.get('dynamic_width_cost', 0.0):.4f}, "
+                    f"hard_ce {loss_stats.get('dynamic_width_hard_loss', 0.0):.4f}, "
                     f"total {loss_stats.get('total_loss', lossf):.4f}"
                 )
             for layer in width_stats["layers"]:
