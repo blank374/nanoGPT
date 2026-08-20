@@ -245,20 +245,78 @@ class AdaptiveWidthMLP(nn.Module):
         self.last_router_entropy = entropy
         return x
 
+class FreeChannelMLP(nn.Module):
+    """
+    Per-token, per-channel gated MLP.
+
+    All hidden channels are structurally symmetric: the router emits one sigmoid
+    decision per channel instead of choosing among fixed width buckets.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.max_hidden = 4 * config.n_embd
+        self.c_fc = nn.Linear(config.n_embd, self.max_hidden, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(self.max_hidden, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        self.gate_network = nn.Linear(config.n_embd, self.max_hidden, bias=config.bias)
+        self.temperature = config.free_channel_temperature
+        self.routing = config.free_channel_routing
+        self.threshold = config.free_channel_threshold
+        self.last_gate_prob = None
+        self.last_gate = None
+        self.last_active_channels = None
+        self.last_gate_entropy = None
+
+    def forward(self, x):
+        gate_logits = self.gate_network(x)
+        gate_prob = torch.sigmoid(gate_logits / self.temperature)
+        hard_gate = (gate_prob > self.threshold).to(gate_prob.dtype)
+
+        if self.routing == "soft":
+            gate = gate_prob
+        elif self.training:
+            gate = hard_gate + gate_prob - gate_prob.detach()
+        else:
+            gate = hard_gate
+
+        hidden = self.c_fc(x)
+        hidden = self.gelu(hidden)
+        hidden = hidden * gate.to(hidden.dtype)
+        x = self.c_proj(hidden)
+        x = self.dropout(x)
+
+        gate_prob_f = gate_prob.float()
+        active_channels = gate.detach().float().sum(dim=-1)
+        entropy = -(
+            gate_prob_f * torch.log(gate_prob_f.clamp_min(1e-9))
+            + (1.0 - gate_prob_f) * torch.log((1.0 - gate_prob_f).clamp_min(1e-9))
+        ).sum(dim=-1)
+        self.last_gate_prob = gate_prob
+        self.last_gate = gate
+        self.last_active_channels = active_channels
+        self.last_gate_entropy = entropy
+        return x
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        assert not (config.dynamic_mlp and config.dynamic_width), "dynamic_mlp and dynamic_width are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp]) <= 1, \
+            "dynamic_mlp, dynamic_width, and free_channel_mlp are mutually exclusive"
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.dynamic_mlp = config.dynamic_mlp
         self.dynamic_width = config.dynamic_width
+        self.free_channel_mlp = config.free_channel_mlp
         if config.dynamic_mlp:
             self.mlp = FastSlowMLP(config)
         elif config.dynamic_width:
             self.mlp = AdaptiveWidthMLP(config)
+        elif config.free_channel_mlp:
+            self.mlp = FreeChannelMLP(config)
         else:
             self.mlp = MLP(config)
 
@@ -322,6 +380,15 @@ class GPTConfig:
     dynamic_width_routing: str = "soft" # "soft" or "ste"
     dynamic_width_hard_loss_weight: float = 0.0
     dynamic_width_entropy_weight: float = 0.0
+    free_channel_mlp: bool = False
+    free_channel_routing: str = "soft" # "soft" or "ste"
+    free_channel_threshold: float = 0.5
+    free_channel_target_ratio: float = 0.4
+    free_channel_budget_weight: float = 0.01
+    free_channel_cost_weight: float = 0.0
+    free_channel_temperature: float = 2.0
+    free_channel_temperature_final: float = 0.5
+    free_channel_temperature_anneal_iters: int = 1000
 
 class GPT(nn.Module):
 
@@ -329,10 +396,12 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        assert not (config.dynamic_mlp and config.dynamic_width), "dynamic_mlp and dynamic_width are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp]) <= 1, \
+            "dynamic_mlp, dynamic_width, and free_channel_mlp are mutually exclusive"
         if config.dynamic_width_ratios is None:
             config.dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
         assert config.dynamic_width_routing in ("soft", "ste"), "dynamic_width_routing must be 'soft' or 'ste'"
+        assert config.free_channel_routing in ("soft", "ste"), "free_channel_routing must be 'soft' or 'ste'"
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -352,6 +421,7 @@ class GPT(nn.Module):
         self.last_exit_details = None
         self.last_dynamic_mlp_stats = None
         self.last_dynamic_width_stats = None
+        self.last_free_channel_stats = None
         self.last_loss_stats = None
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -386,6 +456,14 @@ class GPT(nn.Module):
                 "dynamic width enabled: "
                 f"widths={width_choices}, "
                 f"cost_weight={config.dynamic_width_cost_weight}"
+            )
+        if config.free_channel_mlp:
+            print(
+                "free-channel MLP enabled: "
+                f"max_hidden={4 * config.n_embd}, "
+                f"routing={config.free_channel_routing}, "
+                f"target_ratio={config.free_channel_target_ratio}, "
+                f"budget_weight={config.free_channel_budget_weight}"
             )
 
     def _normalize_exit_layers(self, exit_layers):
@@ -617,6 +695,141 @@ class GPT(nn.Module):
             "layers": layer_stats,
         }
 
+    def _free_channel_modules(self):
+        modules = []
+        for layer_idx, block in enumerate(self.transformer.h, start=1):
+            if isinstance(block.mlp, FreeChannelMLP) and block.mlp.last_gate is not None:
+                modules.append((layer_idx, block.mlp))
+        return modules
+
+    def set_free_channel_temperature(self, temperature):
+        if not self.config.free_channel_mlp:
+            return
+        self.config.free_channel_temperature = temperature
+        for block in self.transformer.h:
+            if isinstance(block.mlp, FreeChannelMLP):
+                block.mlp.temperature = temperature
+
+    def _free_channel_loss_terms(self, modules, valid_mask):
+        if not modules:
+            return None, None
+        gates = torch.stack([mlp.last_gate for _, mlp in modules])
+        gate_probs = torch.stack([mlp.last_gate_prob for _, mlp in modules])
+        if valid_mask is not None:
+            valid = valid_mask.unsqueeze(0).unsqueeze(-1)
+            gates = gates[valid.expand_as(gates)]
+            gate_probs = gate_probs[valid.expand_as(gate_probs)]
+        mean_gate_ratio = gates.float().mean()
+        budget_loss = (mean_gate_ratio - self.config.free_channel_target_ratio) ** 2
+        channel_cost = gate_probs.float().mean()
+        return budget_loss, channel_cost
+
+    def _set_free_channel_stats(self, modules, valid_mask=None):
+        if not modules:
+            self.last_free_channel_stats = None
+            return
+        max_hidden = float(modules[0][1].max_hidden)
+        bins = [(0, 64), (65, 128), (129, 192), (193, 256),
+                (257, 320), (321, 384), (385, 448), (449, int(max_hidden))]
+        layer_stats = []
+        all_active = []
+        all_entropy = []
+        all_gate_prob = []
+        all_gate = []
+
+        for layer_idx, mlp in modules:
+            active = mlp.last_active_channels.detach().float()
+            entropy = mlp.last_gate_entropy.detach().float()
+            gate_prob = mlp.last_gate_prob.detach().float()
+            gate = mlp.last_gate.detach().float()
+            if valid_mask is not None:
+                active_values = active[valid_mask]
+                entropy_values = entropy[valid_mask]
+                gate_prob_values = gate_prob[valid_mask]
+                gate_values = gate[valid_mask]
+            else:
+                active_values = active.reshape(-1)
+                entropy_values = entropy.reshape(-1)
+                gate_prob_values = gate_prob.reshape(-1, gate_prob.size(-1))
+                gate_values = gate.reshape(-1, gate.size(-1))
+            hist = {
+                f"{lo}-{hi}": ((active_values >= lo) & (active_values <= hi)).float().mean().item()
+                for lo, hi in bins
+            }
+            quantiles = torch.quantile(
+                active_values.float(),
+                torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90], device=active_values.device),
+            )
+            layer_stats.append({
+                "layer": layer_idx,
+                "mean_active_channels": active_values.mean().item(),
+                "median_active_channels": active_values.median().item(),
+                "std_active_channels": active_values.std(unbiased=False).item(),
+                "min_active_channels": active_values.min().item(),
+                "max_active_channels": active_values.max().item(),
+                "gate_entropy": entropy_values.mean().item(),
+                "fraction_gate_gt_0_5": (gate_prob_values > 0.5).float().mean().item(),
+                "fraction_gate_gt_0_9": (gate_prob_values > 0.9).float().mean().item(),
+                "fraction_gate_lt_0_1": (gate_prob_values < 0.1).float().mean().item(),
+                "active_width_histogram": hist,
+                "active_width_quantiles": {
+                    "p10": quantiles[0].item(),
+                    "p25": quantiles[1].item(),
+                    "p50": quantiles[2].item(),
+                    "p75": quantiles[3].item(),
+                    "p90": quantiles[4].item(),
+                },
+                "mean_channel_usage_rate": gate_values.mean(dim=0).mean().item(),
+                "std_channel_usage_rate": gate_values.mean(dim=0).std(unbiased=False).item(),
+                "min_channel_usage_rate": gate_values.mean(dim=0).min().item(),
+                "max_channel_usage_rate": gate_values.mean(dim=0).max().item(),
+            })
+            all_active.append(active_values)
+            all_entropy.append(entropy_values)
+            all_gate_prob.append(gate_prob_values)
+            all_gate.append(gate_values)
+
+        active_cat = torch.cat(all_active)
+        entropy_cat = torch.cat(all_entropy)
+        gate_prob_cat = torch.cat(all_gate_prob)
+        gate_cat = torch.cat(all_gate)
+        hist = {
+            f"{lo}-{hi}": ((active_cat >= lo) & (active_cat <= hi)).float().mean().item()
+            for lo, hi in bins
+        }
+        quantiles = torch.quantile(
+            active_cat.float(),
+            torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90], device=active_cat.device),
+        )
+        channel_usage = gate_cat.mean(dim=0)
+        self.last_free_channel_stats = {
+            "max_width": max_hidden,
+            "mean_active_channels": active_cat.mean().item(),
+            "mean_active_ratio": (active_cat.mean() / max_hidden).item(),
+            "median_active_channels": active_cat.median().item(),
+            "std_active_channels": active_cat.std(unbiased=False).item(),
+            "min_active_channels": active_cat.min().item(),
+            "max_active_channels": active_cat.max().item(),
+            "gate_entropy": entropy_cat.mean().item(),
+            "fraction_gate_gt_0_5": (gate_prob_cat > 0.5).float().mean().item(),
+            "fraction_gate_gt_0_9": (gate_prob_cat > 0.9).float().mean().item(),
+            "fraction_gate_lt_0_1": (gate_prob_cat < 0.1).float().mean().item(),
+            "active_width_histogram": hist,
+            "active_width_quantiles": {
+                "p10": quantiles[0].item(),
+                "p25": quantiles[1].item(),
+                "p50": quantiles[2].item(),
+                "p75": quantiles[3].item(),
+                "p90": quantiles[4].item(),
+            },
+            "channel_usage_rate": channel_usage.detach().cpu(),
+            "mean_channel_usage_rate": channel_usage.mean().item(),
+            "std_channel_usage_rate": channel_usage.std(unbiased=False).item(),
+            "min_channel_usage_rate": channel_usage.min().item(),
+            "max_channel_usage_rate": channel_usage.max().item(),
+            "layers": layer_stats,
+        }
+
     def _forward_dynamic_inference(self, idx, pos):
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
@@ -687,6 +900,7 @@ class GPT(nn.Module):
             gates, hard_masks = self._dynamic_mlp_gates()
             self._set_dynamic_mlp_stats(gates, hard_masks)
             self._set_dynamic_width_stats(self._dynamic_width_modules())
+            self._set_free_channel_stats(self._free_channel_modules())
 
         return final_logits, None
 
@@ -746,6 +960,13 @@ class GPT(nn.Module):
                 )
                 loss = loss + self.config.dynamic_width_hard_loss_weight * dynamic_width_hard_loss
             self._set_dynamic_width_stats(width_modules, valid_mask=targets != -1)
+            free_channel_modules = self._free_channel_modules()
+            free_channel_budget_loss, free_channel_cost = self._free_channel_loss_terms(free_channel_modules, targets != -1)
+            if free_channel_budget_loss is not None:
+                loss = loss + self.config.free_channel_budget_weight * free_channel_budget_loss
+            if free_channel_cost is not None and self.config.free_channel_cost_weight != 0.0:
+                loss = loss + self.config.free_channel_cost_weight * free_channel_cost
+            self._set_free_channel_stats(free_channel_modules, valid_mask=targets != -1)
             self.last_loss_stats = {
                 "task_loss": task_loss.detach().item(),
                 "total_loss": loss.detach().item(),
@@ -758,6 +979,10 @@ class GPT(nn.Module):
                 self.last_loss_stats["dynamic_width_entropy"] = dynamic_width_entropy.detach().item()
             if dynamic_width_hard_loss is not None:
                 self.last_loss_stats["dynamic_width_hard_loss"] = dynamic_width_hard_loss.detach().item()
+            if free_channel_budget_loss is not None:
+                self.last_loss_stats["free_channel_budget_loss"] = free_channel_budget_loss.detach().item()
+            if free_channel_cost is not None:
+                self.last_loss_stats["free_channel_cost"] = free_channel_cost.detach().item()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             loss = None
@@ -767,6 +992,7 @@ class GPT(nn.Module):
             gates, hard_masks = self._dynamic_mlp_gates()
             self._set_dynamic_mlp_stats(gates, hard_masks)
             self._set_dynamic_width_stats(self._dynamic_width_modules())
+            self._set_free_channel_stats(self._free_channel_modules())
 
         return logits, loss
 

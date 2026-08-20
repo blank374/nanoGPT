@@ -83,6 +83,16 @@ dynamic_width_temperature_anneal_iters = 0
 dynamic_width_routing = "soft" # "soft" or "ste"
 dynamic_width_hard_loss_weight = 0.0
 dynamic_width_entropy_weight = 0.0
+# free per-channel MLP routing
+free_channel_mlp = False
+free_channel_routing = "soft" # "soft" or "ste"
+free_channel_threshold = 0.5
+free_channel_target_ratio = 0.4
+free_channel_budget_weight = 0.01
+free_channel_cost_weight = 0.0
+free_channel_temperature = 2.0
+free_channel_temperature_final = 0.5
+free_channel_temperature_anneal_iters = 1000
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -198,7 +208,16 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   dynamic_width_temperature_anneal_iters=dynamic_width_temperature_anneal_iters,
                   dynamic_width_routing=dynamic_width_routing,
                   dynamic_width_hard_loss_weight=dynamic_width_hard_loss_weight,
-                  dynamic_width_entropy_weight=dynamic_width_entropy_weight) # start with model_args from command line
+                  dynamic_width_entropy_weight=dynamic_width_entropy_weight,
+                  free_channel_mlp=free_channel_mlp,
+                  free_channel_routing=free_channel_routing,
+                  free_channel_threshold=free_channel_threshold,
+                  free_channel_target_ratio=free_channel_target_ratio,
+                  free_channel_budget_weight=free_channel_budget_weight,
+                  free_channel_cost_weight=free_channel_cost_weight,
+                  free_channel_temperature=free_channel_temperature,
+                  free_channel_temperature_final=free_channel_temperature_final,
+                  free_channel_temperature_anneal_iters=free_channel_temperature_anneal_iters) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -229,7 +248,12 @@ elif init_from == 'resume':
               'dynamic_width_cost_weight', 'dynamic_width_hard_eval',
               'dynamic_width_temperature', 'dynamic_width_temperature_final',
               'dynamic_width_temperature_anneal_iters', 'dynamic_width_routing',
-              'dynamic_width_hard_loss_weight', 'dynamic_width_entropy_weight']:
+              'dynamic_width_hard_loss_weight', 'dynamic_width_entropy_weight',
+              'free_channel_mlp', 'free_channel_routing',
+              'free_channel_threshold', 'free_channel_target_ratio',
+              'free_channel_budget_weight', 'free_channel_cost_weight',
+              'free_channel_temperature', 'free_channel_temperature_final',
+              'free_channel_temperature_anneal_iters']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -321,6 +345,12 @@ def get_dynamic_width_temperature(it):
     ratio = min(max(it / dynamic_width_temperature_anneal_iters, 0.0), 1.0)
     return dynamic_width_temperature + ratio * (dynamic_width_temperature_final - dynamic_width_temperature)
 
+def get_free_channel_temperature(it):
+    if not free_channel_mlp or free_channel_temperature_anneal_iters <= 0:
+        return free_channel_temperature
+    ratio = min(max(it / free_channel_temperature_anneal_iters, 0.0), 1.0)
+    return free_channel_temperature + ratio * (free_channel_temperature_final - free_channel_temperature)
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -340,6 +370,8 @@ while True:
         param_group['lr'] = lr
     if dynamic_width:
         raw_model.set_dynamic_width_temperature(get_dynamic_width_temperature(iter_num))
+    if free_channel_mlp:
+        raw_model.set_free_channel_temperature(get_free_channel_temperature(iter_num))
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -365,6 +397,31 @@ while True:
                     f"    eval layer {layer['layer']}: mean_width {layer['mean_effective_width']:.2f}, "
                     f"entropy {layer['router_entropy']:.4f}, {layer_dist}"
                 )
+        free_stats = raw_model.last_free_channel_stats
+        if free_stats is not None:
+            hist = ", ".join(
+                f"{bucket}={frac:.3f}"
+                for bucket, frac in free_stats["active_width_histogram"].items()
+            )
+            q = free_stats["active_width_quantiles"]
+            print(
+                f"  eval_free_channel: mean_active {free_stats['mean_active_channels']:.2f} "
+                f"({100 * free_stats['mean_active_ratio']:.2f}%), "
+                f"median {free_stats['median_active_channels']:.2f}, "
+                f"std {free_stats['std_active_channels']:.2f}, "
+                f"entropy {free_stats['gate_entropy']:.2f}"
+            )
+            print(
+                f"    quantiles: p10 {q['p10']:.1f}, p25 {q['p25']:.1f}, "
+                f"p50 {q['p50']:.1f}, p75 {q['p75']:.1f}, p90 {q['p90']:.1f}"
+            )
+            print(f"    active_hist: {hist}")
+            print(
+                f"    channel_usage: mean {free_stats['mean_channel_usage_rate']:.4f}, "
+                f"std {free_stats['std_channel_usage_rate']:.4f}, "
+                f"min {free_stats['min_channel_usage_rate']:.4f}, "
+                f"max {free_stats['max_channel_usage_rate']:.4f}"
+            )
         if wandb_log:
             wandb_metrics = {
                 "iter": iter_num,
@@ -382,12 +439,33 @@ while True:
                 })
                 for width in width_stats["width_choices"]:
                     wandb_metrics[f"dynamic_width/width{width}_fraction"] = width_stats["width_fractions"][str(width)]
+            if free_stats is not None:
+                q = free_stats["active_width_quantiles"]
+                wandb_metrics.update({
+                    "free_channel/mean_active_channels": free_stats["mean_active_channels"],
+                    "free_channel/mean_active_ratio": free_stats["mean_active_ratio"],
+                    "free_channel/median_active_channels": free_stats["median_active_channels"],
+                    "free_channel/std_active_channels": free_stats["std_active_channels"],
+                    "free_channel/gate_entropy": free_stats["gate_entropy"],
+                    "free_channel/fraction_gate_gt_0_5": free_stats["fraction_gate_gt_0_5"],
+                    "free_channel/fraction_gate_gt_0_9": free_stats["fraction_gate_gt_0_9"],
+                    "free_channel/fraction_gate_lt_0_1": free_stats["fraction_gate_lt_0_1"],
+                    "free_channel/channel_usage_std": free_stats["std_channel_usage_rate"],
+                    "free_channel/temperature": raw_model.config.free_channel_temperature,
+                    "free_channel/p10_width": q["p10"],
+                    "free_channel/p50_width": q["p50"],
+                    "free_channel/p90_width": q["p90"],
+                })
+                for bucket, frac in free_stats["active_width_histogram"].items():
+                    wandb_metrics[f"free_channel/hist_{bucket}"] = frac
             wandb.log(wandb_metrics)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
                 if dynamic_width:
                     model_args['dynamic_width_temperature'] = raw_model.config.dynamic_width_temperature
+                if free_channel_mlp:
+                    model_args['free_channel_temperature'] = raw_model.config.free_channel_temperature
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -474,6 +552,31 @@ while True:
                 print(
                     f"    layer {layer['layer']}: mean_width {layer['mean_effective_width']:.2f}, "
                     f"entropy {layer['router_entropy']:.4f}, {layer_dist}"
+                )
+        free_stats = raw_model.last_free_channel_stats
+        if free_stats is not None:
+            loss_stats = raw_model.last_loss_stats or {}
+            q = free_stats["active_width_quantiles"]
+            print(
+                f"  free_channel: mean_active {free_stats['mean_active_channels']:.2f} "
+                f"({100 * free_stats['mean_active_ratio']:.2f}%), "
+                f"median {free_stats['median_active_channels']:.2f}, "
+                f"std {free_stats['std_active_channels']:.2f}, "
+                f"p10/p50/p90 {q['p10']:.1f}/{q['p50']:.1f}/{q['p90']:.1f}, "
+                f"entropy {free_stats['gate_entropy']:.2f}"
+            )
+            print(
+                f"  gate_probs: >0.5 {free_stats['fraction_gate_gt_0_5']:.4f}, "
+                f">0.9 {free_stats['fraction_gate_gt_0_9']:.4f}, "
+                f"<0.1 {free_stats['fraction_gate_lt_0_1']:.4f}, "
+                f"channel_usage_std {free_stats['std_channel_usage_rate']:.4f}"
+            )
+            if loss_stats:
+                print(
+                    f"  losses: task_ce {loss_stats.get('task_loss', 0.0):.4f}, "
+                    f"budget {loss_stats.get('free_channel_budget_loss', 0.0):.6f}, "
+                    f"cost {loss_stats.get('free_channel_cost', 0.0):.4f}, "
+                    f"total {loss_stats.get('total_loss', lossf):.4f}"
                 )
     iter_num += 1
     local_iter_num += 1

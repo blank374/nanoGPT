@@ -1,0 +1,6 @@
+budget_weight,ppl,mean_active_width,p90_minus_p10,channel_usage_std,source
+0.0,7.847620507669502,147.22410583496094,119.0,0.09256857633590698,out-free-channel-budget-0p0/free_channel_summary.csv
+0.001,7.838314993145014,147.33290100097656,123.0,0.09471894055604935,out-free-channel-budget-0p001/free_channel_summary.csv
+0.01,7.8169524130623165,151.21334838867188,121.0,0.09520132839679718,out-free-channel-budget-0p01/free_channel_summary.csv
+0.1,7.8557170412580595,183.96798706054688,96.0,0.10460486263036728,out-free-channel-budget-0p1/free_channel_summary.csv
+1.0,7.917226846099344,200.6729736328125,89.0,0.11317035555839539,out-free-channel-budget-1p0/free_channel_summary.csv
