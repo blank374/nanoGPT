@@ -24,7 +24,7 @@ import torch
 from torch.nn import functional as F
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from model import FreeChannelMLP, GPTConfig, GPT
+from model import BlockSparseMLP, FreeChannelMLP, GPTConfig, GPT
 
 
 def parse_args():
@@ -59,7 +59,7 @@ def load_model(out_dir, checkpoint_name, device):
 
 
 def free_channel_modules(model):
-    return [block.mlp for block in model.transformer.h if isinstance(block.mlp, FreeChannelMLP)]
+    return [block.mlp for block in model.transformer.h if isinstance(block.mlp, (FreeChannelMLP, BlockSparseMLP))]
 
 
 def get_dataset_name(args, checkpoint):
@@ -192,8 +192,9 @@ def flatten_channel_rows(checkpoint_name, checkpoint, stats, layer_channel_usage
 @torch.no_grad()
 def analyze_checkpoint(args, checkpoint_name):
     model, checkpoint = load_model(args.out_dir, checkpoint_name, args.device)
-    assert model.config.free_channel_mlp, "checkpoint must have free_channel_mlp=True"
-    assert free_channel_modules(model), "checkpoint must contain FreeChannelMLP modules"
+    assert model.config.free_channel_mlp or model.config.block_sparse_mlp, \
+        "checkpoint must have free_channel_mlp=True or block_sparse_mlp=True"
+    assert free_channel_modules(model), "checkpoint must contain FreeChannelMLP or BlockSparseMLP modules"
     dataset = get_dataset_name(args, checkpoint)
     data = load_data(dataset, args.split)
 
@@ -231,7 +232,7 @@ def analyze_checkpoint(args, checkpoint_name):
             for mlp in free_channel_modules(model)
         ]))
         for layer_idx, block in enumerate(model.transformer.h, start=1):
-            if isinstance(block.mlp, FreeChannelMLP):
+            if isinstance(block.mlp, (FreeChannelMLP, BlockSparseMLP)):
                 layer_gate_values.setdefault(layer_idx, []).append(
                     block.mlp.last_gate.detach().float().reshape(-1, block.mlp.max_hidden).cpu()
                 )

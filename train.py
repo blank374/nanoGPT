@@ -83,6 +83,7 @@ dynamic_width_temperature_anneal_iters = 0
 dynamic_width_routing = "soft" # "soft" or "ste"
 dynamic_width_hard_loss_weight = 0.0
 dynamic_width_entropy_weight = 0.0
+dynamic_width_sliced_eval = True
 # free per-channel MLP routing
 free_channel_mlp = False
 free_channel_routing = "soft" # "soft" or "ste"
@@ -93,6 +94,21 @@ free_channel_cost_weight = 0.0
 free_channel_temperature = 2.0
 free_channel_temperature_final = 0.5
 free_channel_temperature_anneal_iters = 1000
+free_channel_eval_impl = "dense_mask"
+free_channel_prefix_granularity = 64
+# block-wise routed MLP with true sliced eval path
+block_sparse_mlp = False
+block_sparse_block_size = 16
+block_sparse_routing = "ste" # "soft" or "ste"
+block_sparse_threshold = 0.5
+block_sparse_target_ratio = 0.4
+block_sparse_budget_weight = 0.01
+block_sparse_cost_weight = 0.0
+block_sparse_temperature = 2.0
+block_sparse_temperature_final = 0.5
+block_sparse_temperature_anneal_iters = 1000
+block_sparse_sliced_eval = True
+block_sparse_eval_impl = "grouped"
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -209,6 +225,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   dynamic_width_routing=dynamic_width_routing,
                   dynamic_width_hard_loss_weight=dynamic_width_hard_loss_weight,
                   dynamic_width_entropy_weight=dynamic_width_entropy_weight,
+                  dynamic_width_sliced_eval=dynamic_width_sliced_eval,
                   free_channel_mlp=free_channel_mlp,
                   free_channel_routing=free_channel_routing,
                   free_channel_threshold=free_channel_threshold,
@@ -217,7 +234,21 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   free_channel_cost_weight=free_channel_cost_weight,
                   free_channel_temperature=free_channel_temperature,
                   free_channel_temperature_final=free_channel_temperature_final,
-                  free_channel_temperature_anneal_iters=free_channel_temperature_anneal_iters) # start with model_args from command line
+                  free_channel_temperature_anneal_iters=free_channel_temperature_anneal_iters,
+                  free_channel_eval_impl=free_channel_eval_impl,
+                  free_channel_prefix_granularity=free_channel_prefix_granularity,
+                  block_sparse_mlp=block_sparse_mlp,
+                  block_sparse_block_size=block_sparse_block_size,
+                  block_sparse_routing=block_sparse_routing,
+                  block_sparse_threshold=block_sparse_threshold,
+                  block_sparse_target_ratio=block_sparse_target_ratio,
+                  block_sparse_budget_weight=block_sparse_budget_weight,
+                  block_sparse_cost_weight=block_sparse_cost_weight,
+                  block_sparse_temperature=block_sparse_temperature,
+                  block_sparse_temperature_final=block_sparse_temperature_final,
+                  block_sparse_temperature_anneal_iters=block_sparse_temperature_anneal_iters,
+                  block_sparse_sliced_eval=block_sparse_sliced_eval,
+                  block_sparse_eval_impl=block_sparse_eval_impl) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -249,11 +280,19 @@ elif init_from == 'resume':
               'dynamic_width_temperature', 'dynamic_width_temperature_final',
               'dynamic_width_temperature_anneal_iters', 'dynamic_width_routing',
               'dynamic_width_hard_loss_weight', 'dynamic_width_entropy_weight',
+              'dynamic_width_sliced_eval',
               'free_channel_mlp', 'free_channel_routing',
               'free_channel_threshold', 'free_channel_target_ratio',
               'free_channel_budget_weight', 'free_channel_cost_weight',
               'free_channel_temperature', 'free_channel_temperature_final',
-              'free_channel_temperature_anneal_iters']:
+              'free_channel_temperature_anneal_iters', 'free_channel_eval_impl',
+              'free_channel_prefix_granularity', 'block_sparse_mlp',
+              'block_sparse_block_size', 'block_sparse_routing',
+              'block_sparse_threshold', 'block_sparse_target_ratio',
+              'block_sparse_budget_weight', 'block_sparse_cost_weight',
+              'block_sparse_temperature', 'block_sparse_temperature_final',
+              'block_sparse_temperature_anneal_iters', 'block_sparse_sliced_eval',
+              'block_sparse_eval_impl']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -351,6 +390,12 @@ def get_free_channel_temperature(it):
     ratio = min(max(it / free_channel_temperature_anneal_iters, 0.0), 1.0)
     return free_channel_temperature + ratio * (free_channel_temperature_final - free_channel_temperature)
 
+def get_block_sparse_temperature(it):
+    if not block_sparse_mlp or block_sparse_temperature_anneal_iters <= 0:
+        return block_sparse_temperature
+    ratio = min(max(it / block_sparse_temperature_anneal_iters, 0.0), 1.0)
+    return block_sparse_temperature + ratio * (block_sparse_temperature_final - block_sparse_temperature)
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -372,6 +417,8 @@ while True:
         raw_model.set_dynamic_width_temperature(get_dynamic_width_temperature(iter_num))
     if free_channel_mlp:
         raw_model.set_free_channel_temperature(get_free_channel_temperature(iter_num))
+    if block_sparse_mlp:
+        raw_model.set_block_sparse_temperature(get_block_sparse_temperature(iter_num))
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -466,6 +513,8 @@ while True:
                     model_args['dynamic_width_temperature'] = raw_model.config.dynamic_width_temperature
                 if free_channel_mlp:
                     model_args['free_channel_temperature'] = raw_model.config.free_channel_temperature
+                if block_sparse_mlp:
+                    model_args['block_sparse_temperature'] = raw_model.config.block_sparse_temperature
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),

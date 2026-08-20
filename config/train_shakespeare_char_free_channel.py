@@ -35,6 +35,8 @@ free_channel_cost_weight = 0.0
 free_channel_temperature = 2.0
 free_channel_temperature_final = 0.5
 free_channel_temperature_anneal_iters = 1000
+free_channel_eval_impl = "dense_mask"
+free_channel_prefix_granularity = 64
 
 learning_rate = 1e-3
 max_iters = 1000

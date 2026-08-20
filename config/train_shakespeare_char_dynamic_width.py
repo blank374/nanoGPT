@@ -35,6 +35,7 @@ dynamic_width_temperature_anneal_iters = 0
 dynamic_width_routing = "soft"
 dynamic_width_hard_loss_weight = 0.0
 dynamic_width_entropy_weight = 0.0
+dynamic_width_sliced_eval = True
 
 learning_rate = 1e-3
 max_iters = 1000

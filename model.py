@@ -188,6 +188,7 @@ class AdaptiveWidthMLP(nn.Module):
         self.router = WidthRouter(config, len(width_choices))
         self.temperature = config.dynamic_width_temperature
         self.hard_eval = config.dynamic_width_hard_eval
+        self.sliced_eval = config.dynamic_width_sliced_eval
         self.routing = config.dynamic_width_routing
         self.force_hard = False
         masks = torch.zeros(len(width_choices), self.max_hidden)
@@ -205,16 +206,57 @@ class AdaptiveWidthMLP(nn.Module):
         self.last_effective_width = None
         self.last_router_entropy = None
 
+    def _forward_dense_mask(self, x, mask):
+        hidden = self.c_fc(x)
+        hidden = self.gelu(hidden)
+        hidden = hidden * mask
+        x = self.c_proj(hidden)
+        return self.dropout(x)
+
+    def _forward_sliced(self, x, selected):
+        B, T, C = x.size()
+        x_flat = x.reshape(B * T, C)
+        selected_flat = selected.reshape(B * T)
+
+        if x_flat.size(0) == 1:
+            width = self.width_choices[int(selected_flat.item())]
+            fc_bias = self.c_fc.bias[:width] if self.c_fc.bias is not None else None
+            hidden = F.linear(x_flat, self.c_fc.weight[:width], fc_bias)
+            hidden = self.gelu(hidden)
+            out = F.linear(hidden, self.c_proj.weight[:, :width], self.c_proj.bias)
+            return self.dropout(out.view(B, T, C))
+
+        out_flat = torch.zeros_like(x_flat)
+
+        for width_idx, width in enumerate(self.width_choices):
+            token_idx = (selected_flat == width_idx).nonzero(as_tuple=False).flatten()
+            if token_idx.numel() == 0:
+                continue
+            fc_bias = self.c_fc.bias[:width] if self.c_fc.bias is not None else None
+            hidden = F.linear(
+                x_flat.index_select(0, token_idx),
+                self.c_fc.weight[:width],
+                fc_bias,
+            )
+            hidden = self.gelu(hidden)
+            out = F.linear(hidden, self.c_proj.weight[:, :width], None)
+            out_flat.index_add_(0, token_idx, out)
+
+        if self.c_proj.bias is not None:
+            out_flat = out_flat + self.c_proj.bias
+        return self.dropout(out_flat.view(B, T, C))
+
     def forward(self, x):
         router_logits = self.router(x)
         probs = F.softmax(router_logits / self.temperature, dim=-1)
 
+        use_hard = self.force_width_index is not None or self.force_hard or (self.hard_eval and not self.training)
         if self.force_width_index is not None:
             selected = torch.full(x.shape[:2], int(self.force_width_index), dtype=torch.long, device=x.device)
             mask = self.width_masks[selected].to(x.dtype)
             expected_cost = self.width_costs[selected].to(x.dtype)
             effective_width = self.width_values[selected].to(x.dtype)
-        elif self.force_hard or (self.hard_eval and not self.training):
+        elif use_hard:
             selected = probs.argmax(dim=-1)
             mask = self.width_masks[selected].to(x.dtype)
             expected_cost = self.width_costs[selected].to(x.dtype)
@@ -231,18 +273,15 @@ class AdaptiveWidthMLP(nn.Module):
             expected_cost = torch.matmul(probs, self.width_costs.to(probs.dtype))
             effective_width = torch.matmul(probs, self.width_values.to(probs.dtype)).to(x.dtype)
 
-        hidden = self.c_fc(x)
-        hidden = self.gelu(hidden)
-        hidden = hidden * mask
-        x = self.c_proj(hidden)
-        x = self.dropout(x)
-
         entropy = -(probs.float() * torch.log(probs.float().clamp_min(1e-9))).sum(dim=-1)
         self.last_width_probs = probs
         self.last_selected_width_idx = selected.detach()
         self.last_expected_cost = expected_cost
         self.last_effective_width = effective_width.detach()
         self.last_router_entropy = entropy
+        if use_hard and not self.training and self.sliced_eval:
+            return self._forward_sliced(x, selected)
+        x = self._forward_dense_mask(x, mask)
         return x
 
 class FreeChannelMLP(nn.Module):
@@ -264,10 +303,73 @@ class FreeChannelMLP(nn.Module):
         self.temperature = config.free_channel_temperature
         self.routing = config.free_channel_routing
         self.threshold = config.free_channel_threshold
+        self.eval_impl = config.free_channel_eval_impl
+        self.prefix_granularity = config.free_channel_prefix_granularity
         self.last_gate_prob = None
         self.last_gate = None
         self.last_active_channels = None
         self.last_gate_entropy = None
+
+    def _forward_dense_mask(self, x, gate):
+        hidden = self.c_fc(x)
+        hidden = self.gelu(hidden)
+        hidden = hidden * gate.to(hidden.dtype)
+        x = self.c_proj(hidden)
+        return self.dropout(x)
+
+    def _forward_prefix_sliced(self, x, hard_gate, active_channels):
+        B, T, C = x.size()
+        x_flat = x.reshape(B * T, C)
+        gate_flat = hard_gate.reshape(B * T, self.max_hidden).to(x.dtype)
+        if self.eval_impl == "prefix_cover_sliced":
+            ranks = torch.arange(1, self.max_hidden + 1, device=x.device, dtype=torch.long)
+            width = (hard_gate.to(torch.long) * ranks).amax(dim=-1)
+            width_flat = width.reshape(B * T)
+        else:
+            width_flat = active_channels.reshape(B * T).to(torch.long)
+        if self.prefix_granularity > 1:
+            width_flat = (
+                (width_flat + self.prefix_granularity - 1)
+                // self.prefix_granularity
+                * self.prefix_granularity
+            )
+            width_flat = width_flat.clamp(max=self.max_hidden)
+        self.last_active_channels = width_flat.view(B, T).float()
+
+        if x_flat.size(0) == 1:
+            width = int(width_flat.item())
+            if width == 0:
+                out = x_flat.new_zeros(x_flat.shape)
+                if self.c_proj.bias is not None:
+                    out = out + self.c_proj.bias
+                return self.dropout(out.view(B, T, C))
+            fc_bias = self.c_fc.bias[:width] if self.c_fc.bias is not None else None
+            hidden = F.linear(x_flat, self.c_fc.weight[:width], fc_bias)
+            hidden = self.gelu(hidden)
+            hidden = hidden * gate_flat[:, :width]
+            out = F.linear(hidden, self.c_proj.weight[:, :width], self.c_proj.bias)
+            return self.dropout(out.view(B, T, C))
+
+        out_flat = torch.zeros_like(x_flat)
+        for width in torch.unique(width_flat).tolist():
+            width = int(width)
+            token_idx = (width_flat == width).nonzero(as_tuple=False).flatten()
+            if width == 0:
+                continue
+            fc_bias = self.c_fc.bias[:width] if self.c_fc.bias is not None else None
+            hidden = F.linear(
+                x_flat.index_select(0, token_idx),
+                self.c_fc.weight[:width],
+                fc_bias,
+            )
+            hidden = self.gelu(hidden)
+            hidden = hidden * gate_flat.index_select(0, token_idx)[:, :width]
+            out = F.linear(hidden, self.c_proj.weight[:, :width], None)
+            out_flat.index_add_(0, token_idx, out)
+
+        if self.c_proj.bias is not None:
+            out_flat = out_flat + self.c_proj.bias
+        return self.dropout(out_flat.view(B, T, C))
 
     def forward(self, x):
         gate_logits = self.gate_network(x)
@@ -281,12 +383,6 @@ class FreeChannelMLP(nn.Module):
         else:
             gate = hard_gate
 
-        hidden = self.c_fc(x)
-        hidden = self.gelu(hidden)
-        hidden = hidden * gate.to(hidden.dtype)
-        x = self.c_proj(hidden)
-        x = self.dropout(x)
-
         gate_prob_f = gate_prob.float()
         active_channels = gate.detach().float().sum(dim=-1)
         entropy = -(
@@ -297,26 +393,156 @@ class FreeChannelMLP(nn.Module):
         self.last_gate = gate
         self.last_active_channels = active_channels
         self.last_gate_entropy = entropy
+        if not self.training and self.eval_impl in ("prefix_sliced", "prefix_cover_sliced") and self.routing == "ste":
+            return self._forward_prefix_sliced(x, hard_gate, active_channels)
+        x = self._forward_dense_mask(x, gate)
         return x
+
+class BlockSparseMLP(nn.Module):
+    """
+    Block-wise gated MLP with an eval-time sliced Linear path.
+
+    Training uses the same dense-mask approximation as FreeChannelMLP. During
+    eval, sliced_eval=True skips inactive hidden-channel blocks before c_fc and
+    c_proj, so it is a real compute-skipping prototype rather than mask-only.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.max_hidden = 4 * config.n_embd
+        self.block_size = config.block_sparse_block_size
+        assert self.max_hidden % self.block_size == 0, \
+            f"max hidden {self.max_hidden} must be divisible by block size {self.block_size}"
+        self.num_blocks = self.max_hidden // self.block_size
+        self.c_fc = nn.Linear(config.n_embd, self.max_hidden, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(self.max_hidden, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        self.gate_network = nn.Linear(config.n_embd, self.num_blocks, bias=config.bias)
+        self.temperature = config.block_sparse_temperature
+        self.routing = config.block_sparse_routing
+        self.threshold = config.block_sparse_threshold
+        self.sliced_eval = config.block_sparse_sliced_eval
+        self.eval_impl = config.block_sparse_eval_impl
+        self.last_gate_prob = None
+        self.last_gate = None
+        self.last_active_channels = None
+        self.last_gate_entropy = None
+
+    def _channel_gate(self, block_gate):
+        return block_gate.repeat_interleave(self.block_size, dim=-1)
+
+    def _record_stats(self, gate_prob, gate):
+        gate_prob_f = gate_prob.float()
+        entropy = -(
+            gate_prob_f * torch.log(gate_prob_f.clamp_min(1e-9))
+            + (1.0 - gate_prob_f) * torch.log((1.0 - gate_prob_f).clamp_min(1e-9))
+        ).sum(dim=-1) * self.block_size
+        self.last_gate_prob = self._channel_gate(gate_prob)
+        self.last_gate = self._channel_gate(gate)
+        self.last_active_channels = gate.detach().float().sum(dim=-1) * self.block_size
+        self.last_gate_entropy = entropy
+
+    def _forward_dense_mask(self, x, gate):
+        hidden = self.c_fc(x)
+        hidden = self.gelu(hidden)
+        hidden = hidden * self._channel_gate(gate).to(hidden.dtype)
+        x = self.c_proj(hidden)
+        return self.dropout(x)
+
+    def _forward_sliced(self, x, hard_gate):
+        B, T, C = x.size()
+        x_flat = x.reshape(B * T, C)
+        hard_flat = hard_gate.reshape(B * T, self.num_blocks).bool()
+        out_flat = torch.zeros_like(x_flat)
+
+        for block_idx in range(self.num_blocks):
+            token_mask = hard_flat[:, block_idx]
+            if not token_mask.any():
+                continue
+            start = block_idx * self.block_size
+            end = start + self.block_size
+            fc_bias = self.c_fc.bias[start:end] if self.c_fc.bias is not None else None
+            hidden = F.linear(x_flat[token_mask], self.c_fc.weight[start:end], fc_bias)
+            hidden = self.gelu(hidden)
+            out_flat[token_mask] += F.linear(hidden, self.c_proj.weight[:, start:end], None)
+
+        if self.c_proj.bias is not None:
+            out_flat = out_flat + self.c_proj.bias
+        return self.dropout(out_flat.view(B, T, C))
+
+    def _forward_grouped_sliced(self, x, hard_gate):
+        B, T, C = x.size()
+        x_flat = x.reshape(B * T, C)
+        hard_flat = hard_gate.reshape(B * T, self.num_blocks).bool()
+        out_flat = torch.zeros_like(x_flat)
+
+        patterns, inverse = torch.unique(hard_flat, dim=0, return_inverse=True)
+        channel_template = torch.arange(
+            self.block_size, device=x.device, dtype=torch.long
+        ).unsqueeze(0)
+        for pattern_idx, pattern in enumerate(patterns):
+            active_blocks = pattern.nonzero(as_tuple=False).flatten()
+            if active_blocks.numel() == 0:
+                continue
+            token_idx = (inverse == pattern_idx).nonzero(as_tuple=False).flatten()
+            channels = (
+                active_blocks.unsqueeze(1) * self.block_size + channel_template
+            ).reshape(-1)
+            fc_bias = self.c_fc.bias.index_select(0, channels) if self.c_fc.bias is not None else None
+            hidden = F.linear(
+                x_flat.index_select(0, token_idx),
+                self.c_fc.weight.index_select(0, channels),
+                fc_bias,
+            )
+            hidden = self.gelu(hidden)
+            out = F.linear(hidden, self.c_proj.weight.index_select(1, channels), None)
+            out_flat.index_add_(0, token_idx, out)
+
+        if self.c_proj.bias is not None:
+            out_flat = out_flat + self.c_proj.bias
+        return self.dropout(out_flat.view(B, T, C))
+
+    def forward(self, x):
+        gate_logits = self.gate_network(x)
+        gate_prob = torch.sigmoid(gate_logits / self.temperature)
+        hard_gate = (gate_prob > self.threshold).to(gate_prob.dtype)
+
+        if self.routing == "soft":
+            gate = gate_prob
+        elif self.training:
+            gate = hard_gate + gate_prob - gate_prob.detach()
+        else:
+            gate = hard_gate
+
+        self._record_stats(gate_prob, gate)
+        if not self.training and self.sliced_eval and self.routing == "ste":
+            if self.eval_impl == "grouped":
+                return self._forward_grouped_sliced(x, hard_gate)
+            return self._forward_sliced(x, hard_gate)
+        return self._forward_dense_mask(x, gate)
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp]) <= 1, \
-            "dynamic_mlp, dynamic_width, and free_channel_mlp are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp]) <= 1, \
+            "dynamic_mlp, dynamic_width, free_channel_mlp, and block_sparse_mlp are mutually exclusive"
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.dynamic_mlp = config.dynamic_mlp
         self.dynamic_width = config.dynamic_width
         self.free_channel_mlp = config.free_channel_mlp
+        self.block_sparse_mlp = config.block_sparse_mlp
         if config.dynamic_mlp:
             self.mlp = FastSlowMLP(config)
         elif config.dynamic_width:
             self.mlp = AdaptiveWidthMLP(config)
         elif config.free_channel_mlp:
             self.mlp = FreeChannelMLP(config)
+        elif config.block_sparse_mlp:
+            self.mlp = BlockSparseMLP(config)
         else:
             self.mlp = MLP(config)
 
@@ -380,6 +606,7 @@ class GPTConfig:
     dynamic_width_routing: str = "soft" # "soft" or "ste"
     dynamic_width_hard_loss_weight: float = 0.0
     dynamic_width_entropy_weight: float = 0.0
+    dynamic_width_sliced_eval: bool = True
     free_channel_mlp: bool = False
     free_channel_routing: str = "soft" # "soft" or "ste"
     free_channel_threshold: float = 0.5
@@ -389,6 +616,20 @@ class GPTConfig:
     free_channel_temperature: float = 2.0
     free_channel_temperature_final: float = 0.5
     free_channel_temperature_anneal_iters: int = 1000
+    free_channel_eval_impl: str = "dense_mask" # "dense_mask", "prefix_sliced", or "prefix_cover_sliced"
+    free_channel_prefix_granularity: int = 64
+    block_sparse_mlp: bool = False
+    block_sparse_block_size: int = 16
+    block_sparse_routing: str = "ste" # "soft" or "ste"
+    block_sparse_threshold: float = 0.5
+    block_sparse_target_ratio: float = 0.4
+    block_sparse_budget_weight: float = 0.01
+    block_sparse_cost_weight: float = 0.0
+    block_sparse_temperature: float = 2.0
+    block_sparse_temperature_final: float = 0.5
+    block_sparse_temperature_anneal_iters: int = 1000
+    block_sparse_sliced_eval: bool = True
+    block_sparse_eval_impl: str = "grouped" # "block" or "grouped"
 
 class GPT(nn.Module):
 
@@ -396,12 +637,16 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp]) <= 1, \
-            "dynamic_mlp, dynamic_width, and free_channel_mlp are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp]) <= 1, \
+            "dynamic_mlp, dynamic_width, free_channel_mlp, and block_sparse_mlp are mutually exclusive"
         if config.dynamic_width_ratios is None:
             config.dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
         assert config.dynamic_width_routing in ("soft", "ste"), "dynamic_width_routing must be 'soft' or 'ste'"
         assert config.free_channel_routing in ("soft", "ste"), "free_channel_routing must be 'soft' or 'ste'"
+        assert config.free_channel_eval_impl in ("dense_mask", "prefix_sliced", "prefix_cover_sliced"), \
+            "free_channel_eval_impl must be 'dense_mask', 'prefix_sliced', or 'prefix_cover_sliced'"
+        assert config.block_sparse_routing in ("soft", "ste"), "block_sparse_routing must be 'soft' or 'ste'"
+        assert config.block_sparse_eval_impl in ("block", "grouped"), "block_sparse_eval_impl must be 'block' or 'grouped'"
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -464,6 +709,16 @@ class GPT(nn.Module):
                 f"routing={config.free_channel_routing}, "
                 f"target_ratio={config.free_channel_target_ratio}, "
                 f"budget_weight={config.free_channel_budget_weight}"
+            )
+        if config.block_sparse_mlp:
+            print(
+                "block-sparse MLP enabled: "
+                f"max_hidden={4 * config.n_embd}, "
+                f"block_size={config.block_sparse_block_size}, "
+                f"routing={config.block_sparse_routing}, "
+                f"target_ratio={config.block_sparse_target_ratio}, "
+                f"budget_weight={config.block_sparse_budget_weight}, "
+                f"sliced_eval={config.block_sparse_sliced_eval}"
             )
 
     def _normalize_exit_layers(self, exit_layers):
@@ -698,7 +953,7 @@ class GPT(nn.Module):
     def _free_channel_modules(self):
         modules = []
         for layer_idx, block in enumerate(self.transformer.h, start=1):
-            if isinstance(block.mlp, FreeChannelMLP) and block.mlp.last_gate is not None:
+            if isinstance(block.mlp, (FreeChannelMLP, BlockSparseMLP)) and block.mlp.last_gate is not None:
                 modules.append((layer_idx, block.mlp))
         return modules
 
@@ -708,6 +963,14 @@ class GPT(nn.Module):
         self.config.free_channel_temperature = temperature
         for block in self.transformer.h:
             if isinstance(block.mlp, FreeChannelMLP):
+                block.mlp.temperature = temperature
+
+    def set_block_sparse_temperature(self, temperature):
+        if not self.config.block_sparse_mlp:
+            return
+        self.config.block_sparse_temperature = temperature
+        for block in self.transformer.h:
+            if isinstance(block.mlp, BlockSparseMLP):
                 block.mlp.temperature = temperature
 
     def _free_channel_loss_terms(self, modules, valid_mask):
@@ -720,7 +983,8 @@ class GPT(nn.Module):
             gates = gates[valid.expand_as(gates)]
             gate_probs = gate_probs[valid.expand_as(gate_probs)]
         mean_gate_ratio = gates.float().mean()
-        budget_loss = (mean_gate_ratio - self.config.free_channel_target_ratio) ** 2
+        target_ratio = self.config.block_sparse_target_ratio if self.config.block_sparse_mlp else self.config.free_channel_target_ratio
+        budget_loss = (mean_gate_ratio - target_ratio) ** 2
         channel_cost = gate_probs.float().mean()
         return budget_loss, channel_cost
 
@@ -962,10 +1226,12 @@ class GPT(nn.Module):
             self._set_dynamic_width_stats(width_modules, valid_mask=targets != -1)
             free_channel_modules = self._free_channel_modules()
             free_channel_budget_loss, free_channel_cost = self._free_channel_loss_terms(free_channel_modules, targets != -1)
+            budget_weight = self.config.block_sparse_budget_weight if self.config.block_sparse_mlp else self.config.free_channel_budget_weight
+            cost_weight = self.config.block_sparse_cost_weight if self.config.block_sparse_mlp else self.config.free_channel_cost_weight
             if free_channel_budget_loss is not None:
-                loss = loss + self.config.free_channel_budget_weight * free_channel_budget_loss
-            if free_channel_cost is not None and self.config.free_channel_cost_weight != 0.0:
-                loss = loss + self.config.free_channel_cost_weight * free_channel_cost
+                loss = loss + budget_weight * free_channel_budget_loss
+            if free_channel_cost is not None and cost_weight != 0.0:
+                loss = loss + cost_weight * free_channel_cost
             self._set_free_channel_stats(free_channel_modules, valid_mask=targets != -1)
             self.last_loss_stats = {
                 "task_loss": task_loss.detach().item(),
