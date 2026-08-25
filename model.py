@@ -522,12 +522,162 @@ class BlockSparseMLP(nn.Module):
             return self._forward_sliced(x, hard_gate)
         return self._forward_dense_mask(x, gate)
 
+class BlockPrecisionMLP(nn.Module):
+    """
+    Hardware-aligned Width x Bit MLP prototype.
+
+    The controller emits a continuous prefix-block width demand plus per-block
+    precision logits. Forward uses hard block/bit choices with STE during
+    training, while the resource term tracks MLP weight bits fetched per token.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.max_hidden = 4 * config.n_embd
+        self.block_size = config.block_precision_block_size
+        assert self.max_hidden % self.block_size == 0, \
+            f"max hidden {self.max_hidden} must be divisible by block size {self.block_size}"
+        self.num_blocks = self.max_hidden // self.block_size
+        bit_choices = [int(bit) for bit in config.block_precision_bit_choices]
+        assert bit_choices, "block_precision_bit_choices must not be empty"
+        assert all(bit >= 2 for bit in bit_choices), "fake quantization needs bit choices >= 2"
+        self.bit_choices = bit_choices
+        self.c_fc = nn.Linear(config.n_embd, self.max_hidden, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(self.max_hidden, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        self.width_network = nn.Linear(config.n_embd, 1, bias=config.bias)
+        self.bit_network = nn.Linear(config.n_embd, self.num_blocks * len(bit_choices), bias=config.bias)
+        self.temperature = config.block_precision_temperature
+        self.width_temperature = config.block_precision_width_temperature
+        self.routing = config.block_precision_routing
+        self.sliced_eval = config.block_precision_sliced_eval
+        self.eval_impl = config.block_precision_eval_impl
+        self.register_buffer("bit_values", torch.tensor(bit_choices, dtype=torch.float32))
+        self.last_width_demand = None
+        self.last_hard_blocks = None
+        self.last_block_gate = None
+        self.last_bit_probs = None
+        self.last_bit_onehot = None
+        self.last_selected_bits = None
+        self.last_weight_bits_per_token = None
+        self.last_bit_entropy = None
+
+    def _channel_gate(self, block_gate):
+        return block_gate.repeat_interleave(self.block_size, dim=-1)
+
+    def _fake_quant_weight(self, weight, bits):
+        if bits >= 16:
+            return weight
+        qmax = (1 << (bits - 1)) - 1
+        scale = weight.detach().abs().amax().clamp_min(1e-8) / qmax
+        q = torch.clamp(torch.round(weight / scale), -qmax, qmax)
+        quantized = q * scale
+        return weight + (quantized - weight).detach()
+
+    def _route(self, x):
+        B, T, _ = x.size()
+        width_raw = self.width_network(x).squeeze(-1)
+        width_demand = torch.sigmoid(width_raw) * self.num_blocks
+        block_ids = torch.arange(self.num_blocks, device=x.device, dtype=width_demand.dtype)
+        soft_gate = torch.sigmoid((width_demand.unsqueeze(-1) - block_ids) / self.width_temperature)
+        hard_blocks = torch.ceil(width_demand).clamp(1, self.num_blocks).to(torch.long)
+        hard_gate = (block_ids.unsqueeze(0).unsqueeze(0) < hard_blocks.unsqueeze(-1)).to(soft_gate.dtype)
+
+        bit_logits = self.bit_network(x).view(B, T, self.num_blocks, len(self.bit_choices))
+        bit_probs = F.softmax(bit_logits / self.temperature, dim=-1)
+        selected = bit_probs.argmax(dim=-1)
+        hard_bit = F.one_hot(selected, num_classes=len(self.bit_choices)).to(bit_probs.dtype)
+
+        if self.routing == "soft":
+            block_gate = soft_gate
+            bit_onehot = bit_probs
+        elif self.training:
+            block_gate = hard_gate + soft_gate - soft_gate.detach()
+            bit_onehot = hard_bit + bit_probs - bit_probs.detach()
+        else:
+            block_gate = hard_gate
+            bit_onehot = hard_bit
+
+        entropy = -(bit_probs.float() * torch.log(bit_probs.float().clamp_min(1e-9))).sum(dim=-1)
+        bits = torch.matmul(bit_onehot, self.bit_values.to(bit_onehot.dtype))
+        weight_bits = (
+            block_gate.float()
+            * bits.float()
+            * self.block_size
+            * (self.c_fc.in_features + self.c_proj.out_features)
+        ).sum(dim=-1)
+
+        self.last_width_demand = width_demand
+        self.last_hard_blocks = hard_blocks.detach()
+        self.last_block_gate = block_gate
+        self.last_bit_probs = bit_probs
+        self.last_bit_onehot = bit_onehot
+        self.last_selected_bits = self.bit_values.to(x.device)[selected].detach()
+        self.last_weight_bits_per_token = weight_bits
+        self.last_bit_entropy = entropy
+        return block_gate, bit_onehot
+
+    def _forward_dense_mask(self, x, block_gate, bit_onehot):
+        out = torch.zeros_like(x)
+        for bit_idx, bits in enumerate(self.bit_choices):
+            bit_block_gate = block_gate * bit_onehot[..., bit_idx]
+            channel_gate = self._channel_gate(bit_block_gate).to(x.dtype)
+            fc_weight = self._fake_quant_weight(self.c_fc.weight, bits)
+            proj_weight = self._fake_quant_weight(self.c_proj.weight, bits)
+            hidden = F.linear(x, fc_weight, self.c_fc.bias)
+            hidden = self.gelu(hidden)
+            hidden = hidden * channel_gate
+            out = out + F.linear(hidden, proj_weight, None)
+        if self.c_proj.bias is not None:
+            out = out + self.c_proj.bias
+        return self.dropout(out)
+
+    def _forward_grouped_sliced(self, x, block_gate, bit_onehot):
+        hard_gate = (block_gate > 0.5)
+        selected_bit_idx = bit_onehot.argmax(dim=-1)
+        B, T, C = x.size()
+        x_flat = x.reshape(B * T, C)
+        gate_flat = hard_gate.reshape(B * T, self.num_blocks)
+        bit_flat = selected_bit_idx.reshape(B * T, self.num_blocks)
+        signature = torch.where(gate_flat, bit_flat + 1, torch.zeros_like(bit_flat))
+        patterns, inverse = torch.unique(signature, dim=0, return_inverse=True)
+        out_flat = torch.zeros_like(x_flat)
+        channel_template = torch.arange(self.block_size, device=x.device, dtype=torch.long).unsqueeze(0)
+
+        for pattern_idx, pattern in enumerate(patterns):
+            token_idx = (inverse == pattern_idx).nonzero(as_tuple=False).flatten()
+            for bit_idx, bits in enumerate(self.bit_choices):
+                active_blocks = (pattern == bit_idx + 1).nonzero(as_tuple=False).flatten()
+                if active_blocks.numel() == 0:
+                    continue
+                channels = (
+                    active_blocks.unsqueeze(1) * self.block_size + channel_template
+                ).reshape(-1)
+                fc_weight = self._fake_quant_weight(self.c_fc.weight, bits).index_select(0, channels)
+                proj_weight = self._fake_quant_weight(self.c_proj.weight, bits).index_select(1, channels)
+                fc_bias = self.c_fc.bias.index_select(0, channels) if self.c_fc.bias is not None else None
+                hidden = F.linear(x_flat.index_select(0, token_idx), fc_weight, fc_bias)
+                hidden = self.gelu(hidden)
+                out = F.linear(hidden, proj_weight, None)
+                out_flat.index_add_(0, token_idx, out)
+
+        if self.c_proj.bias is not None:
+            out_flat = out_flat + self.c_proj.bias
+        return self.dropout(out_flat.view(B, T, C))
+
+    def forward(self, x):
+        block_gate, bit_onehot = self._route(x)
+        if not self.training and self.sliced_eval and self.routing == "ste" and self.eval_impl == "grouped":
+            return self._forward_grouped_sliced(x, block_gate, bit_onehot)
+        return self._forward_dense_mask(x, block_gate, bit_onehot)
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp]) <= 1, \
-            "dynamic_mlp, dynamic_width, free_channel_mlp, and block_sparse_mlp are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp]) <= 1, \
+            "dynamic_mlp, dynamic_width, free_channel_mlp, block_sparse_mlp, and block_precision_mlp are mutually exclusive"
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
@@ -535,6 +685,7 @@ class Block(nn.Module):
         self.dynamic_width = config.dynamic_width
         self.free_channel_mlp = config.free_channel_mlp
         self.block_sparse_mlp = config.block_sparse_mlp
+        self.block_precision_mlp = config.block_precision_mlp
         if config.dynamic_mlp:
             self.mlp = FastSlowMLP(config)
         elif config.dynamic_width:
@@ -543,6 +694,8 @@ class Block(nn.Module):
             self.mlp = FreeChannelMLP(config)
         elif config.block_sparse_mlp:
             self.mlp = BlockSparseMLP(config)
+        elif config.block_precision_mlp:
+            self.mlp = BlockPrecisionMLP(config)
         else:
             self.mlp = MLP(config)
 
@@ -630,6 +783,17 @@ class GPTConfig:
     block_sparse_temperature_anneal_iters: int = 1000
     block_sparse_sliced_eval: bool = True
     block_sparse_eval_impl: str = "grouped" # "block" or "grouped"
+    block_precision_mlp: bool = False
+    block_precision_block_size: int = 16
+    block_precision_bit_choices: list = None
+    block_precision_routing: str = "ste" # "soft" or "ste"
+    block_precision_cost_weight: float = 0.01
+    block_precision_temperature: float = 1.0
+    block_precision_temperature_final: float = 1.0
+    block_precision_temperature_anneal_iters: int = 0
+    block_precision_width_temperature: float = 1.0
+    block_precision_sliced_eval: bool = True
+    block_precision_eval_impl: str = "grouped" # "dense_mask" or "grouped"
 
 class GPT(nn.Module):
 
@@ -637,16 +801,21 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp]) <= 1, \
-            "dynamic_mlp, dynamic_width, free_channel_mlp, and block_sparse_mlp are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp]) <= 1, \
+            "dynamic_mlp, dynamic_width, free_channel_mlp, block_sparse_mlp, and block_precision_mlp are mutually exclusive"
         if config.dynamic_width_ratios is None:
             config.dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
+        if config.block_precision_bit_choices is None:
+            config.block_precision_bit_choices = [2, 4, 8, 16]
         assert config.dynamic_width_routing in ("soft", "ste"), "dynamic_width_routing must be 'soft' or 'ste'"
         assert config.free_channel_routing in ("soft", "ste"), "free_channel_routing must be 'soft' or 'ste'"
         assert config.free_channel_eval_impl in ("dense_mask", "prefix_sliced", "prefix_cover_sliced"), \
             "free_channel_eval_impl must be 'dense_mask', 'prefix_sliced', or 'prefix_cover_sliced'"
         assert config.block_sparse_routing in ("soft", "ste"), "block_sparse_routing must be 'soft' or 'ste'"
         assert config.block_sparse_eval_impl in ("block", "grouped"), "block_sparse_eval_impl must be 'block' or 'grouped'"
+        assert config.block_precision_routing in ("soft", "ste"), "block_precision_routing must be 'soft' or 'ste'"
+        assert config.block_precision_eval_impl in ("dense_mask", "grouped"), \
+            "block_precision_eval_impl must be 'dense_mask' or 'grouped'"
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -667,6 +836,7 @@ class GPT(nn.Module):
         self.last_dynamic_mlp_stats = None
         self.last_dynamic_width_stats = None
         self.last_free_channel_stats = None
+        self.last_block_precision_stats = None
         self.last_loss_stats = None
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -719,6 +889,16 @@ class GPT(nn.Module):
                 f"target_ratio={config.block_sparse_target_ratio}, "
                 f"budget_weight={config.block_sparse_budget_weight}, "
                 f"sliced_eval={config.block_sparse_sliced_eval}"
+            )
+        if config.block_precision_mlp:
+            print(
+                "block-precision MLP enabled: "
+                f"max_hidden={4 * config.n_embd}, "
+                f"block_size={config.block_precision_block_size}, "
+                f"bits={config.block_precision_bit_choices}, "
+                f"routing={config.block_precision_routing}, "
+                f"cost_weight={config.block_precision_cost_weight}, "
+                f"sliced_eval={config.block_precision_sliced_eval}"
             )
 
     def _normalize_exit_layers(self, exit_layers):
@@ -1094,6 +1274,127 @@ class GPT(nn.Module):
             "layers": layer_stats,
         }
 
+    def _block_precision_modules(self):
+        modules = []
+        for layer_idx, block in enumerate(self.transformer.h, start=1):
+            if isinstance(block.mlp, BlockPrecisionMLP) and block.mlp.last_block_gate is not None:
+                modules.append((layer_idx, block.mlp))
+        return modules
+
+    def set_block_precision_temperature(self, temperature):
+        if not self.config.block_precision_mlp:
+            return
+        self.config.block_precision_temperature = temperature
+        for block in self.transformer.h:
+            if isinstance(block.mlp, BlockPrecisionMLP):
+                block.mlp.temperature = temperature
+
+    def _block_precision_loss_terms(self, modules, valid_mask):
+        if not modules:
+            return None
+        costs = torch.stack([mlp.last_weight_bits_per_token for _, mlp in modules])
+        max_costs = torch.tensor(
+            [
+                mlp.num_blocks
+                * mlp.block_size
+                * (mlp.c_fc.in_features + mlp.c_proj.out_features)
+                * max(mlp.bit_choices)
+                for _, mlp in modules
+            ],
+            device=costs.device,
+            dtype=costs.dtype,
+        ).view(-1, 1, 1)
+        normalized = costs / max_costs.clamp_min(1.0)
+        if valid_mask is not None:
+            valid = valid_mask.unsqueeze(0)
+            normalized = normalized[valid.expand_as(normalized)]
+        return normalized.float().mean()
+
+    def _set_block_precision_stats(self, modules, valid_mask=None):
+        if not modules:
+            self.last_block_precision_stats = None
+            return
+        bit_choices = modules[0][1].bit_choices
+        max_hidden = float(modules[0][1].max_hidden)
+        layer_stats = []
+        all_active_blocks = []
+        all_selected_bits = []
+        all_active_bits = []
+        all_costs = []
+        all_entropy = []
+
+        for layer_idx, mlp in modules:
+            block_gate = mlp.last_block_gate.detach().float()
+            hard_blocks = mlp.last_hard_blocks.detach().float()
+            selected_bits = mlp.last_selected_bits.detach().float()
+            costs = mlp.last_weight_bits_per_token.detach().float()
+            entropy = mlp.last_bit_entropy.detach().float()
+            active_mask = block_gate > 0.5
+            if valid_mask is not None:
+                hard_values = hard_blocks[valid_mask]
+                selected_values = selected_bits[valid_mask]
+                active_values = active_mask[valid_mask]
+                costs_values = costs[valid_mask]
+                entropy_values = entropy[valid_mask]
+            else:
+                hard_values = hard_blocks.reshape(-1)
+                selected_values = selected_bits.reshape(-1, selected_bits.size(-1))
+                active_values = active_mask.reshape(-1, active_mask.size(-1))
+                costs_values = costs.reshape(-1)
+                entropy_values = entropy.reshape(-1, entropy.size(-1))
+
+            active_selected = selected_values[active_values]
+            if active_selected.numel() == 0:
+                active_selected = selected_values.reshape(-1)
+            bit_fractions = {
+                str(bit): (active_selected == bit).float().mean().item()
+                for bit in bit_choices
+            }
+            layer_stats.append({
+                "layer": layer_idx,
+                "mean_active_blocks": hard_values.mean().item(),
+                "mean_active_channels": (hard_values.mean() * mlp.block_size).item(),
+                "mean_active_bit": active_selected.mean().item(),
+                "mean_weight_bits_per_token": costs_values.mean().item(),
+                "bit_entropy": entropy_values.mean().item(),
+                "bit_fractions": bit_fractions,
+            })
+            all_active_blocks.append(hard_values)
+            all_selected_bits.append(selected_values)
+            all_active_bits.append(active_values)
+            all_costs.append(costs_values)
+            all_entropy.append(entropy_values)
+
+        active_blocks_cat = torch.cat(all_active_blocks)
+        selected_cat = torch.cat(all_selected_bits)
+        active_cat = torch.cat(all_active_bits)
+        costs_cat = torch.cat(all_costs)
+        entropy_cat = torch.cat(all_entropy)
+        active_selected = selected_cat[active_cat]
+        if active_selected.numel() == 0:
+            active_selected = selected_cat.reshape(-1)
+        max_bits_per_token = (
+            max_hidden
+            * (modules[0][1].c_fc.in_features + modules[0][1].c_proj.out_features)
+            * max(bit_choices)
+        )
+        self.last_block_precision_stats = {
+            "bit_choices": bit_choices,
+            "max_width": max_hidden,
+            "mean_active_blocks": active_blocks_cat.mean().item(),
+            "mean_active_channels": (active_blocks_cat.mean() * modules[0][1].block_size).item(),
+            "mean_active_ratio": (active_blocks_cat.mean() / modules[0][1].num_blocks).item(),
+            "mean_active_bit": active_selected.mean().item(),
+            "mean_weight_bits_per_token": costs_cat.mean().item(),
+            "mean_weight_bit_fraction": (costs_cat.mean() / max_bits_per_token).item(),
+            "bit_entropy": entropy_cat.mean().item(),
+            "bit_fractions": {
+                str(bit): (active_selected == bit).float().mean().item()
+                for bit in bit_choices
+            },
+            "layers": layer_stats,
+        }
+
     def _forward_dynamic_inference(self, idx, pos):
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
@@ -1165,6 +1466,7 @@ class GPT(nn.Module):
             self._set_dynamic_mlp_stats(gates, hard_masks)
             self._set_dynamic_width_stats(self._dynamic_width_modules())
             self._set_free_channel_stats(self._free_channel_modules())
+            self._set_block_precision_stats(self._block_precision_modules())
 
         return final_logits, None
 
@@ -1233,6 +1535,11 @@ class GPT(nn.Module):
             if free_channel_cost is not None and cost_weight != 0.0:
                 loss = loss + cost_weight * free_channel_cost
             self._set_free_channel_stats(free_channel_modules, valid_mask=targets != -1)
+            block_precision_modules = self._block_precision_modules()
+            block_precision_cost = self._block_precision_loss_terms(block_precision_modules, targets != -1)
+            if block_precision_cost is not None:
+                loss = loss + self.config.block_precision_cost_weight * block_precision_cost
+            self._set_block_precision_stats(block_precision_modules, valid_mask=targets != -1)
             self.last_loss_stats = {
                 "task_loss": task_loss.detach().item(),
                 "total_loss": loss.detach().item(),
@@ -1249,6 +1556,8 @@ class GPT(nn.Module):
                 self.last_loss_stats["free_channel_budget_loss"] = free_channel_budget_loss.detach().item()
             if free_channel_cost is not None:
                 self.last_loss_stats["free_channel_cost"] = free_channel_cost.detach().item()
+            if block_precision_cost is not None:
+                self.last_loss_stats["block_precision_cost"] = block_precision_cost.detach().item()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             loss = None
@@ -1259,6 +1568,7 @@ class GPT(nn.Module):
             self._set_dynamic_mlp_stats(gates, hard_masks)
             self._set_dynamic_width_stats(self._dynamic_width_modules())
             self._set_free_channel_stats(self._free_channel_modules())
+            self._set_block_precision_stats(self._block_precision_modules())
 
         return logits, loss
 

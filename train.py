@@ -109,6 +109,18 @@ block_sparse_temperature_final = 0.5
 block_sparse_temperature_anneal_iters = 1000
 block_sparse_sliced_eval = True
 block_sparse_eval_impl = "grouped"
+# block-wise Width x Bit MLP with fake quantized weight paths
+block_precision_mlp = False
+block_precision_block_size = 16
+block_precision_bit_choices = [2, 4, 8, 16]
+block_precision_routing = "ste"
+block_precision_cost_weight = 0.01
+block_precision_temperature = 1.0
+block_precision_temperature_final = 1.0
+block_precision_temperature_anneal_iters = 0
+block_precision_width_temperature = 1.0
+block_precision_sliced_eval = True
+block_precision_eval_impl = "grouped"
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -248,7 +260,18 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   block_sparse_temperature_final=block_sparse_temperature_final,
                   block_sparse_temperature_anneal_iters=block_sparse_temperature_anneal_iters,
                   block_sparse_sliced_eval=block_sparse_sliced_eval,
-                  block_sparse_eval_impl=block_sparse_eval_impl) # start with model_args from command line
+                  block_sparse_eval_impl=block_sparse_eval_impl,
+                  block_precision_mlp=block_precision_mlp,
+                  block_precision_block_size=block_precision_block_size,
+                  block_precision_bit_choices=block_precision_bit_choices,
+                  block_precision_routing=block_precision_routing,
+                  block_precision_cost_weight=block_precision_cost_weight,
+                  block_precision_temperature=block_precision_temperature,
+                  block_precision_temperature_final=block_precision_temperature_final,
+                  block_precision_temperature_anneal_iters=block_precision_temperature_anneal_iters,
+                  block_precision_width_temperature=block_precision_width_temperature,
+                  block_precision_sliced_eval=block_precision_sliced_eval,
+                  block_precision_eval_impl=block_precision_eval_impl) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -292,7 +315,13 @@ elif init_from == 'resume':
               'block_sparse_budget_weight', 'block_sparse_cost_weight',
               'block_sparse_temperature', 'block_sparse_temperature_final',
               'block_sparse_temperature_anneal_iters', 'block_sparse_sliced_eval',
-              'block_sparse_eval_impl']:
+              'block_sparse_eval_impl', 'block_precision_mlp',
+              'block_precision_block_size', 'block_precision_bit_choices',
+              'block_precision_routing', 'block_precision_cost_weight', 'block_precision_temperature',
+              'block_precision_temperature_final',
+              'block_precision_temperature_anneal_iters',
+              'block_precision_width_temperature', 'block_precision_sliced_eval',
+              'block_precision_eval_impl']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -396,6 +425,12 @@ def get_block_sparse_temperature(it):
     ratio = min(max(it / block_sparse_temperature_anneal_iters, 0.0), 1.0)
     return block_sparse_temperature + ratio * (block_sparse_temperature_final - block_sparse_temperature)
 
+def get_block_precision_temperature(it):
+    if not block_precision_mlp or block_precision_temperature_anneal_iters <= 0:
+        return block_precision_temperature
+    ratio = min(max(it / block_precision_temperature_anneal_iters, 0.0), 1.0)
+    return block_precision_temperature + ratio * (block_precision_temperature_final - block_precision_temperature)
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -419,6 +454,8 @@ while True:
         raw_model.set_free_channel_temperature(get_free_channel_temperature(iter_num))
     if block_sparse_mlp:
         raw_model.set_block_sparse_temperature(get_block_sparse_temperature(iter_num))
+    if block_precision_mlp:
+        raw_model.set_block_precision_temperature(get_block_precision_temperature(iter_num))
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -469,6 +506,21 @@ while True:
                 f"min {free_stats['min_channel_usage_rate']:.4f}, "
                 f"max {free_stats['max_channel_usage_rate']:.4f}"
             )
+        block_precision_stats = raw_model.last_block_precision_stats
+        if block_precision_stats is not None:
+            bit_dist = ", ".join(
+                f"b{bit}={block_precision_stats['bit_fractions'][str(bit)]:.3f}"
+                for bit in block_precision_stats["bit_choices"]
+            )
+            print(
+                f"  eval_block_precision: mean_blocks {block_precision_stats['mean_active_blocks']:.2f}, "
+                f"mean_active {block_precision_stats['mean_active_channels']:.2f} "
+                f"({100 * block_precision_stats['mean_active_ratio']:.2f}%), "
+                f"mean_bit {block_precision_stats['mean_active_bit']:.2f}, "
+                f"weight_bits/token {block_precision_stats['mean_weight_bits_per_token']:.1f} "
+                f"({100 * block_precision_stats['mean_weight_bit_fraction']:.2f}%), "
+                f"entropy {block_precision_stats['bit_entropy']:.4f}, {bit_dist}"
+            )
         if wandb_log:
             wandb_metrics = {
                 "iter": iter_num,
@@ -505,6 +557,19 @@ while True:
                 })
                 for bucket, frac in free_stats["active_width_histogram"].items():
                     wandb_metrics[f"free_channel/hist_{bucket}"] = frac
+            if block_precision_stats is not None:
+                wandb_metrics.update({
+                    "block_precision/mean_active_blocks": block_precision_stats["mean_active_blocks"],
+                    "block_precision/mean_active_channels": block_precision_stats["mean_active_channels"],
+                    "block_precision/mean_active_ratio": block_precision_stats["mean_active_ratio"],
+                    "block_precision/mean_active_bit": block_precision_stats["mean_active_bit"],
+                    "block_precision/mean_weight_bits_per_token": block_precision_stats["mean_weight_bits_per_token"],
+                    "block_precision/mean_weight_bit_fraction": block_precision_stats["mean_weight_bit_fraction"],
+                    "block_precision/bit_entropy": block_precision_stats["bit_entropy"],
+                    "block_precision/temperature": raw_model.config.block_precision_temperature,
+                })
+                for bit in block_precision_stats["bit_choices"]:
+                    wandb_metrics[f"block_precision/bit{bit}_fraction"] = block_precision_stats["bit_fractions"][str(bit)]
             wandb.log(wandb_metrics)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -515,6 +580,8 @@ while True:
                     model_args['free_channel_temperature'] = raw_model.config.free_channel_temperature
                 if block_sparse_mlp:
                     model_args['block_sparse_temperature'] = raw_model.config.block_sparse_temperature
+                if block_precision_mlp:
+                    model_args['block_precision_temperature'] = raw_model.config.block_precision_temperature
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -625,6 +692,28 @@ while True:
                     f"  losses: task_ce {loss_stats.get('task_loss', 0.0):.4f}, "
                     f"budget {loss_stats.get('free_channel_budget_loss', 0.0):.6f}, "
                     f"cost {loss_stats.get('free_channel_cost', 0.0):.4f}, "
+                    f"total {loss_stats.get('total_loss', lossf):.4f}"
+                )
+        block_precision_stats = raw_model.last_block_precision_stats
+        if block_precision_stats is not None:
+            loss_stats = raw_model.last_loss_stats or {}
+            bit_dist = ", ".join(
+                f"b{bit}={block_precision_stats['bit_fractions'][str(bit)]:.3f}"
+                for bit in block_precision_stats["bit_choices"]
+            )
+            print(
+                f"  block_precision: mean_blocks {block_precision_stats['mean_active_blocks']:.2f}, "
+                f"mean_active {block_precision_stats['mean_active_channels']:.2f} "
+                f"({100 * block_precision_stats['mean_active_ratio']:.2f}%), "
+                f"mean_bit {block_precision_stats['mean_active_bit']:.2f}, "
+                f"weight_bits/token {block_precision_stats['mean_weight_bits_per_token']:.1f} "
+                f"({100 * block_precision_stats['mean_weight_bit_fraction']:.2f}%), "
+                f"entropy {block_precision_stats['bit_entropy']:.4f}, {bit_dist}"
+            )
+            if loss_stats:
+                print(
+                    f"  losses: task_ce {loss_stats.get('task_loss', 0.0):.4f}, "
+                    f"weight_bit_cost {loss_stats.get('block_precision_cost', 0.0):.4f}, "
                     f"total {loss_stats.get('total_loss', lossf):.4f}"
                 )
     iter_num += 1
