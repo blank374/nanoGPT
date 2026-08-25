@@ -121,6 +121,17 @@ block_precision_temperature_anneal_iters = 0
 block_precision_width_temperature = 1.0
 block_precision_sliced_eval = True
 block_precision_eval_impl = "grouped"
+# batch-friendly resource-mode MLP: each token chooses one (blocks, bit) mode
+resource_mode_mlp = False
+resource_mode_block_size = 16
+resource_mode_choices = [(4, 2), (8, 4), (12, 4), (16, 8), (32, 16)]
+resource_mode_routing = "ste"
+resource_mode_cost_weight = 0.01
+resource_mode_temperature = 1.0
+resource_mode_temperature_final = 1.0
+resource_mode_temperature_anneal_iters = 0
+resource_mode_sliced_eval = True
+resource_mode_eval_impl = "grouped"
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -271,7 +282,17 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   block_precision_temperature_anneal_iters=block_precision_temperature_anneal_iters,
                   block_precision_width_temperature=block_precision_width_temperature,
                   block_precision_sliced_eval=block_precision_sliced_eval,
-                  block_precision_eval_impl=block_precision_eval_impl) # start with model_args from command line
+                  block_precision_eval_impl=block_precision_eval_impl,
+                  resource_mode_mlp=resource_mode_mlp,
+                  resource_mode_block_size=resource_mode_block_size,
+                  resource_mode_choices=resource_mode_choices,
+                  resource_mode_routing=resource_mode_routing,
+                  resource_mode_cost_weight=resource_mode_cost_weight,
+                  resource_mode_temperature=resource_mode_temperature,
+                  resource_mode_temperature_final=resource_mode_temperature_final,
+                  resource_mode_temperature_anneal_iters=resource_mode_temperature_anneal_iters,
+                  resource_mode_sliced_eval=resource_mode_sliced_eval,
+                  resource_mode_eval_impl=resource_mode_eval_impl) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -321,7 +342,12 @@ elif init_from == 'resume':
               'block_precision_temperature_final',
               'block_precision_temperature_anneal_iters',
               'block_precision_width_temperature', 'block_precision_sliced_eval',
-              'block_precision_eval_impl']:
+              'block_precision_eval_impl', 'resource_mode_mlp',
+              'resource_mode_block_size', 'resource_mode_choices',
+              'resource_mode_routing', 'resource_mode_cost_weight',
+              'resource_mode_temperature', 'resource_mode_temperature_final',
+              'resource_mode_temperature_anneal_iters',
+              'resource_mode_sliced_eval', 'resource_mode_eval_impl']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -431,6 +457,12 @@ def get_block_precision_temperature(it):
     ratio = min(max(it / block_precision_temperature_anneal_iters, 0.0), 1.0)
     return block_precision_temperature + ratio * (block_precision_temperature_final - block_precision_temperature)
 
+def get_resource_mode_temperature(it):
+    if not resource_mode_mlp or resource_mode_temperature_anneal_iters <= 0:
+        return resource_mode_temperature
+    ratio = min(max(it / resource_mode_temperature_anneal_iters, 0.0), 1.0)
+    return resource_mode_temperature + ratio * (resource_mode_temperature_final - resource_mode_temperature)
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -456,6 +488,8 @@ while True:
         raw_model.set_block_sparse_temperature(get_block_sparse_temperature(iter_num))
     if block_precision_mlp:
         raw_model.set_block_precision_temperature(get_block_precision_temperature(iter_num))
+    if resource_mode_mlp:
+        raw_model.set_resource_mode_temperature(get_resource_mode_temperature(iter_num))
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -521,6 +555,21 @@ while True:
                 f"({100 * block_precision_stats['mean_weight_bit_fraction']:.2f}%), "
                 f"entropy {block_precision_stats['bit_entropy']:.4f}, {bit_dist}"
             )
+        resource_mode_stats = raw_model.last_resource_mode_stats
+        if resource_mode_stats is not None:
+            mode_dist = ", ".join(
+                f"{mode}={resource_mode_stats['mode_fractions'][mode]:.3f}"
+                for mode in resource_mode_stats["modes"]
+            )
+            print(
+                f"  eval_resource_mode: mean_blocks {resource_mode_stats['mean_active_blocks']:.2f}, "
+                f"mean_active {resource_mode_stats['mean_active_channels']:.2f} "
+                f"({100 * resource_mode_stats['mean_active_ratio']:.2f}%), "
+                f"mean_bit {resource_mode_stats['mean_active_bit']:.2f}, "
+                f"weight_bits/token {resource_mode_stats['mean_weight_bits_per_token']:.1f} "
+                f"({100 * resource_mode_stats['mean_weight_bit_fraction']:.2f}%), "
+                f"entropy {resource_mode_stats['router_entropy']:.4f}, {mode_dist}"
+            )
         if wandb_log:
             wandb_metrics = {
                 "iter": iter_num,
@@ -570,6 +619,19 @@ while True:
                 })
                 for bit in block_precision_stats["bit_choices"]:
                     wandb_metrics[f"block_precision/bit{bit}_fraction"] = block_precision_stats["bit_fractions"][str(bit)]
+            if resource_mode_stats is not None:
+                wandb_metrics.update({
+                    "resource_mode/mean_active_blocks": resource_mode_stats["mean_active_blocks"],
+                    "resource_mode/mean_active_channels": resource_mode_stats["mean_active_channels"],
+                    "resource_mode/mean_active_ratio": resource_mode_stats["mean_active_ratio"],
+                    "resource_mode/mean_active_bit": resource_mode_stats["mean_active_bit"],
+                    "resource_mode/mean_weight_bits_per_token": resource_mode_stats["mean_weight_bits_per_token"],
+                    "resource_mode/mean_weight_bit_fraction": resource_mode_stats["mean_weight_bit_fraction"],
+                    "resource_mode/router_entropy": resource_mode_stats["router_entropy"],
+                    "resource_mode/temperature": raw_model.config.resource_mode_temperature,
+                })
+                for mode in resource_mode_stats["modes"]:
+                    wandb_metrics[f"resource_mode/mode_{mode}_fraction"] = resource_mode_stats["mode_fractions"][mode]
             wandb.log(wandb_metrics)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -582,6 +644,8 @@ while True:
                     model_args['block_sparse_temperature'] = raw_model.config.block_sparse_temperature
                 if block_precision_mlp:
                     model_args['block_precision_temperature'] = raw_model.config.block_precision_temperature
+                if resource_mode_mlp:
+                    model_args['resource_mode_temperature'] = raw_model.config.resource_mode_temperature
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -714,6 +778,28 @@ while True:
                 print(
                     f"  losses: task_ce {loss_stats.get('task_loss', 0.0):.4f}, "
                     f"weight_bit_cost {loss_stats.get('block_precision_cost', 0.0):.4f}, "
+                    f"total {loss_stats.get('total_loss', lossf):.4f}"
+                )
+        resource_mode_stats = raw_model.last_resource_mode_stats
+        if resource_mode_stats is not None:
+            loss_stats = raw_model.last_loss_stats or {}
+            mode_dist = ", ".join(
+                f"{mode}={resource_mode_stats['mode_fractions'][mode]:.3f}"
+                for mode in resource_mode_stats["modes"]
+            )
+            print(
+                f"  resource_mode: mean_blocks {resource_mode_stats['mean_active_blocks']:.2f}, "
+                f"mean_active {resource_mode_stats['mean_active_channels']:.2f} "
+                f"({100 * resource_mode_stats['mean_active_ratio']:.2f}%), "
+                f"mean_bit {resource_mode_stats['mean_active_bit']:.2f}, "
+                f"weight_bits/token {resource_mode_stats['mean_weight_bits_per_token']:.1f} "
+                f"({100 * resource_mode_stats['mean_weight_bit_fraction']:.2f}%), "
+                f"entropy {resource_mode_stats['router_entropy']:.4f}, {mode_dist}"
+            )
+            if loss_stats:
+                print(
+                    f"  losses: task_ce {loss_stats.get('task_loss', 0.0):.4f}, "
+                    f"resource_mode_cost {loss_stats.get('resource_mode_cost', 0.0):.4f}, "
                     f"total {loss_stats.get('total_loss', lossf):.4f}"
                 )
     iter_num += 1

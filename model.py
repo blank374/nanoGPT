@@ -554,6 +554,8 @@ class BlockPrecisionMLP(nn.Module):
         self.sliced_eval = config.block_precision_sliced_eval
         self.eval_impl = config.block_precision_eval_impl
         self.register_buffer("bit_values", torch.tensor(bit_choices, dtype=torch.float32))
+        self.force_blocks = None
+        self.force_bit = None
         self.last_width_demand = None
         self.last_hard_blocks = None
         self.last_block_gate = None
@@ -579,6 +581,9 @@ class BlockPrecisionMLP(nn.Module):
         B, T, _ = x.size()
         width_raw = self.width_network(x).squeeze(-1)
         width_demand = torch.sigmoid(width_raw) * self.num_blocks
+        if self.force_blocks is not None:
+            blocks = max(1, min(int(self.force_blocks), self.num_blocks))
+            width_demand = torch.full_like(width_demand, float(blocks))
         block_ids = torch.arange(self.num_blocks, device=x.device, dtype=width_demand.dtype)
         soft_gate = torch.sigmoid((width_demand.unsqueeze(-1) - block_ids) / self.width_temperature)
         hard_blocks = torch.ceil(width_demand).clamp(1, self.num_blocks).to(torch.long)
@@ -586,6 +591,12 @@ class BlockPrecisionMLP(nn.Module):
 
         bit_logits = self.bit_network(x).view(B, T, self.num_blocks, len(self.bit_choices))
         bit_probs = F.softmax(bit_logits / self.temperature, dim=-1)
+        if self.force_bit is not None:
+            bit_idx = self.bit_choices.index(int(self.force_bit))
+            bit_probs = F.one_hot(
+                torch.full((B, T, self.num_blocks), bit_idx, dtype=torch.long, device=x.device),
+                num_classes=len(self.bit_choices),
+            ).to(bit_logits.dtype)
         selected = bit_probs.argmax(dim=-1)
         hard_bit = F.one_hot(selected, num_classes=len(self.bit_choices)).to(bit_probs.dtype)
 
@@ -672,12 +683,134 @@ class BlockPrecisionMLP(nn.Module):
             return self._forward_grouped_sliced(x, block_gate, bit_onehot)
         return self._forward_dense_mask(x, block_gate, bit_onehot)
 
+class ResourceModeMLP(nn.Module):
+    """
+    Batch-friendly Width x Bit MLP.
+
+    Each token selects one of a small number of executable resource modes such
+    as (4 blocks, 2 bit) or (16 blocks, 8 bit). This keeps the model dynamic
+    while limiting runtime shapes to a few batchable grouped matmuls.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.max_hidden = 4 * config.n_embd
+        self.block_size = config.resource_mode_block_size
+        assert self.max_hidden % self.block_size == 0, \
+            f"max hidden {self.max_hidden} must be divisible by block size {self.block_size}"
+        self.num_blocks = self.max_hidden // self.block_size
+        modes = [(int(blocks), int(bits)) for blocks, bits in config.resource_mode_choices]
+        assert modes, "resource_mode_choices must not be empty"
+        for blocks, bits in modes:
+            assert 1 <= blocks <= self.num_blocks, f"mode blocks must be in [1, {self.num_blocks}]"
+            assert bits >= 2, "fake quantization needs mode bit choices >= 2"
+        self.modes = modes
+        self.c_fc = nn.Linear(config.n_embd, self.max_hidden, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(self.max_hidden, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        self.router = nn.Linear(config.n_embd, len(modes), bias=config.bias)
+        self.temperature = config.resource_mode_temperature
+        self.routing = config.resource_mode_routing
+        self.sliced_eval = config.resource_mode_sliced_eval
+        self.eval_impl = config.resource_mode_eval_impl
+        mode_blocks = torch.tensor([blocks for blocks, _ in modes], dtype=torch.float32)
+        mode_bits = torch.tensor([bits for _, bits in modes], dtype=torch.float32)
+        mode_costs = mode_blocks * self.block_size * mode_bits * (config.n_embd + config.n_embd)
+        self.register_buffer("mode_blocks", mode_blocks)
+        self.register_buffer("mode_bits", mode_bits)
+        self.register_buffer("mode_costs", mode_costs)
+        self.force_mode_index = None
+        self.last_mode_probs = None
+        self.last_mode_onehot = None
+        self.last_selected_mode = None
+        self.last_weight_bits_per_token = None
+        self.last_router_entropy = None
+
+    def _fake_quant_weight(self, weight, bits):
+        if bits >= 16:
+            return weight
+        qmax = (1 << (bits - 1)) - 1
+        scale = weight.detach().abs().amax().clamp_min(1e-8) / qmax
+        q = torch.clamp(torch.round(weight / scale), -qmax, qmax)
+        quantized = q * scale
+        return weight + (quantized - weight).detach()
+
+    def _route(self, x):
+        logits = self.router(x)
+        probs = F.softmax(logits / self.temperature, dim=-1)
+        if self.force_mode_index is not None:
+            selected = torch.full(x.shape[:2], int(self.force_mode_index), dtype=torch.long, device=x.device)
+            hard = F.one_hot(selected, num_classes=len(self.modes)).to(probs.dtype)
+            probs = hard
+        else:
+            selected = probs.argmax(dim=-1)
+            hard = F.one_hot(selected, num_classes=len(self.modes)).to(probs.dtype)
+
+        if self.routing == "soft":
+            mode_onehot = probs
+        elif self.training:
+            mode_onehot = hard + probs - probs.detach()
+        else:
+            mode_onehot = hard
+
+        costs = torch.matmul(mode_onehot.float(), self.mode_costs.to(mode_onehot.device))
+        entropy = -(probs.float() * torch.log(probs.float().clamp_min(1e-9))).sum(dim=-1)
+        self.last_mode_probs = probs
+        self.last_mode_onehot = mode_onehot
+        self.last_selected_mode = selected.detach()
+        self.last_weight_bits_per_token = costs
+        self.last_router_entropy = entropy
+        return mode_onehot
+
+    def _forward_dense_mask(self, x, mode_onehot):
+        out = torch.zeros_like(x)
+        for mode_idx, (blocks, bits) in enumerate(self.modes):
+            width = blocks * self.block_size
+            fc_bias = self.c_fc.bias[:width] if self.c_fc.bias is not None else None
+            fc_weight = self._fake_quant_weight(self.c_fc.weight[:width], bits)
+            proj_weight = self._fake_quant_weight(self.c_proj.weight[:, :width], bits)
+            hidden = F.linear(x, fc_weight, fc_bias)
+            hidden = self.gelu(hidden)
+            mode_out = F.linear(hidden, proj_weight, None)
+            out = out + mode_onehot[..., mode_idx].unsqueeze(-1).to(mode_out.dtype) * mode_out
+        if self.c_proj.bias is not None:
+            out = out + self.c_proj.bias
+        return self.dropout(out)
+
+    def _forward_grouped_sliced(self, x, selected):
+        B, T, C = x.size()
+        x_flat = x.reshape(B * T, C)
+        selected_flat = selected.reshape(B * T)
+        out_flat = torch.zeros_like(x_flat)
+        for mode_idx, (blocks, bits) in enumerate(self.modes):
+            token_idx = (selected_flat == mode_idx).nonzero(as_tuple=False).flatten()
+            if token_idx.numel() == 0:
+                continue
+            width = blocks * self.block_size
+            fc_bias = self.c_fc.bias[:width] if self.c_fc.bias is not None else None
+            fc_weight = self._fake_quant_weight(self.c_fc.weight[:width], bits)
+            proj_weight = self._fake_quant_weight(self.c_proj.weight[:, :width], bits)
+            hidden = F.linear(x_flat.index_select(0, token_idx), fc_weight, fc_bias)
+            hidden = self.gelu(hidden)
+            out = F.linear(hidden, proj_weight, None)
+            out_flat.index_add_(0, token_idx, out)
+        if self.c_proj.bias is not None:
+            out_flat = out_flat + self.c_proj.bias
+        return self.dropout(out_flat.view(B, T, C))
+
+    def forward(self, x):
+        mode_onehot = self._route(x)
+        if not self.training and self.sliced_eval and self.routing == "ste" and self.eval_impl == "grouped":
+            return self._forward_grouped_sliced(x, self.last_selected_mode)
+        return self._forward_dense_mask(x, mode_onehot)
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp]) <= 1, \
-            "dynamic_mlp, dynamic_width, free_channel_mlp, block_sparse_mlp, and block_precision_mlp are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp]) <= 1, \
+            "dynamic_mlp, dynamic_width, free_channel_mlp, block_sparse_mlp, block_precision_mlp, and resource_mode_mlp are mutually exclusive"
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
@@ -686,6 +819,7 @@ class Block(nn.Module):
         self.free_channel_mlp = config.free_channel_mlp
         self.block_sparse_mlp = config.block_sparse_mlp
         self.block_precision_mlp = config.block_precision_mlp
+        self.resource_mode_mlp = config.resource_mode_mlp
         if config.dynamic_mlp:
             self.mlp = FastSlowMLP(config)
         elif config.dynamic_width:
@@ -696,6 +830,8 @@ class Block(nn.Module):
             self.mlp = BlockSparseMLP(config)
         elif config.block_precision_mlp:
             self.mlp = BlockPrecisionMLP(config)
+        elif config.resource_mode_mlp:
+            self.mlp = ResourceModeMLP(config)
         else:
             self.mlp = MLP(config)
 
@@ -794,6 +930,16 @@ class GPTConfig:
     block_precision_width_temperature: float = 1.0
     block_precision_sliced_eval: bool = True
     block_precision_eval_impl: str = "grouped" # "dense_mask" or "grouped"
+    resource_mode_mlp: bool = False
+    resource_mode_block_size: int = 16
+    resource_mode_choices: list = None
+    resource_mode_routing: str = "ste" # "soft" or "ste"
+    resource_mode_cost_weight: float = 0.01
+    resource_mode_temperature: float = 1.0
+    resource_mode_temperature_final: float = 1.0
+    resource_mode_temperature_anneal_iters: int = 0
+    resource_mode_sliced_eval: bool = True
+    resource_mode_eval_impl: str = "grouped" # "dense_mask" or "grouped"
 
 class GPT(nn.Module):
 
@@ -801,12 +947,14 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp]) <= 1, \
-            "dynamic_mlp, dynamic_width, free_channel_mlp, block_sparse_mlp, and block_precision_mlp are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp]) <= 1, \
+            "dynamic_mlp, dynamic_width, free_channel_mlp, block_sparse_mlp, block_precision_mlp, and resource_mode_mlp are mutually exclusive"
         if config.dynamic_width_ratios is None:
             config.dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
         if config.block_precision_bit_choices is None:
             config.block_precision_bit_choices = [2, 4, 8, 16]
+        if config.resource_mode_choices is None:
+            config.resource_mode_choices = [(4, 2), (8, 4), (12, 4), (16, 8), (32, 16)]
         assert config.dynamic_width_routing in ("soft", "ste"), "dynamic_width_routing must be 'soft' or 'ste'"
         assert config.free_channel_routing in ("soft", "ste"), "free_channel_routing must be 'soft' or 'ste'"
         assert config.free_channel_eval_impl in ("dense_mask", "prefix_sliced", "prefix_cover_sliced"), \
@@ -816,6 +964,9 @@ class GPT(nn.Module):
         assert config.block_precision_routing in ("soft", "ste"), "block_precision_routing must be 'soft' or 'ste'"
         assert config.block_precision_eval_impl in ("dense_mask", "grouped"), \
             "block_precision_eval_impl must be 'dense_mask' or 'grouped'"
+        assert config.resource_mode_routing in ("soft", "ste"), "resource_mode_routing must be 'soft' or 'ste'"
+        assert config.resource_mode_eval_impl in ("dense_mask", "grouped"), \
+            "resource_mode_eval_impl must be 'dense_mask' or 'grouped'"
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -837,6 +988,7 @@ class GPT(nn.Module):
         self.last_dynamic_width_stats = None
         self.last_free_channel_stats = None
         self.last_block_precision_stats = None
+        self.last_resource_mode_stats = None
         self.last_loss_stats = None
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -899,6 +1051,16 @@ class GPT(nn.Module):
                 f"routing={config.block_precision_routing}, "
                 f"cost_weight={config.block_precision_cost_weight}, "
                 f"sliced_eval={config.block_precision_sliced_eval}"
+            )
+        if config.resource_mode_mlp:
+            print(
+                "resource-mode MLP enabled: "
+                f"max_hidden={4 * config.n_embd}, "
+                f"block_size={config.resource_mode_block_size}, "
+                f"modes={config.resource_mode_choices}, "
+                f"routing={config.resource_mode_routing}, "
+                f"cost_weight={config.resource_mode_cost_weight}, "
+                f"sliced_eval={config.resource_mode_sliced_eval}"
             )
 
     def _normalize_exit_layers(self, exit_layers):
@@ -1395,6 +1557,130 @@ class GPT(nn.Module):
             "layers": layer_stats,
         }
 
+    def _resource_mode_modules(self):
+        modules = []
+        for layer_idx, block in enumerate(self.transformer.h, start=1):
+            if isinstance(block.mlp, ResourceModeMLP) and block.mlp.last_mode_onehot is not None:
+                modules.append((layer_idx, block.mlp))
+        return modules
+
+    def set_resource_mode_temperature(self, temperature):
+        if not self.config.resource_mode_mlp:
+            return
+        self.config.resource_mode_temperature = temperature
+        for block in self.transformer.h:
+            if isinstance(block.mlp, ResourceModeMLP):
+                block.mlp.temperature = temperature
+
+    def _resource_mode_loss_terms(self, modules, valid_mask):
+        if not modules:
+            return None
+        costs = torch.stack([mlp.last_weight_bits_per_token for _, mlp in modules])
+        max_costs = torch.tensor(
+            [
+                mlp.num_blocks
+                * mlp.block_size
+                * (mlp.c_fc.in_features + mlp.c_proj.out_features)
+                * max(int(bits) for _, bits in mlp.modes)
+                for _, mlp in modules
+            ],
+            device=costs.device,
+            dtype=costs.dtype,
+        ).view(-1, 1, 1)
+        normalized = costs / max_costs.clamp_min(1.0)
+        if valid_mask is not None:
+            valid = valid_mask.unsqueeze(0)
+            normalized = normalized[valid.expand_as(normalized)]
+        return normalized.float().mean()
+
+    def _set_resource_mode_stats(self, modules, valid_mask=None):
+        if not modules:
+            self.last_resource_mode_stats = None
+            return
+        modes = modules[0][1].modes
+        layer_stats = []
+        all_selected = []
+        all_probs = []
+        all_costs = []
+        all_entropy = []
+
+        for layer_idx, mlp in modules:
+            selected = mlp.last_selected_mode.detach()
+            probs = mlp.last_mode_probs.detach().float()
+            costs = mlp.last_weight_bits_per_token.detach().float()
+            entropy = mlp.last_router_entropy.detach().float()
+            if valid_mask is not None:
+                selected_values = selected[valid_mask]
+                probs_values = probs[valid_mask]
+                costs_values = costs[valid_mask]
+                entropy_values = entropy[valid_mask]
+            else:
+                selected_values = selected.reshape(-1)
+                probs_values = probs.reshape(-1, probs.size(-1))
+                costs_values = costs.reshape(-1)
+                entropy_values = entropy.reshape(-1)
+            fractions = torch.bincount(selected_values, minlength=len(modes)).float()
+            fractions = fractions / fractions.sum().clamp_min(1.0)
+            prob_means = probs_values.mean(dim=0)
+            mode_blocks = mlp.mode_blocks.to(selected_values.device)[selected_values].float()
+            mode_bits = mlp.mode_bits.to(selected_values.device)[selected_values].float()
+            layer_stats.append({
+                "layer": layer_idx,
+                "mean_active_blocks": mode_blocks.mean().item(),
+                "mean_active_channels": (mode_blocks.mean() * mlp.block_size).item(),
+                "mean_active_bit": mode_bits.mean().item(),
+                "mean_weight_bits_per_token": costs_values.mean().item(),
+                "router_entropy": entropy_values.mean().item(),
+                "mode_fractions": {
+                    f"{blocks}x{bits}": fractions[i].item()
+                    for i, (blocks, bits) in enumerate(modes)
+                },
+                "mode_prob_means": {
+                    f"{blocks}x{bits}": prob_means[i].item()
+                    for i, (blocks, bits) in enumerate(modes)
+                },
+            })
+            all_selected.append(selected_values)
+            all_probs.append(probs_values)
+            all_costs.append(costs_values)
+            all_entropy.append(entropy_values)
+
+        selected_cat = torch.cat(all_selected)
+        probs_cat = torch.cat(all_probs)
+        costs_cat = torch.cat(all_costs)
+        entropy_cat = torch.cat(all_entropy)
+        fractions = torch.bincount(selected_cat, minlength=len(modes)).float()
+        fractions = fractions / fractions.sum().clamp_min(1.0)
+        prob_means = probs_cat.mean(dim=0)
+        first = modules[0][1]
+        selected_blocks = first.mode_blocks.to(selected_cat.device)[selected_cat].float()
+        selected_bits = first.mode_bits.to(selected_cat.device)[selected_cat].float()
+        max_bits_per_token = (
+            first.num_blocks
+            * first.block_size
+            * (first.c_fc.in_features + first.c_proj.out_features)
+            * max(int(bits) for _, bits in modes)
+        )
+        self.last_resource_mode_stats = {
+            "modes": [f"{blocks}x{bits}" for blocks, bits in modes],
+            "mean_active_blocks": selected_blocks.mean().item(),
+            "mean_active_channels": (selected_blocks.mean() * first.block_size).item(),
+            "mean_active_ratio": (selected_blocks.mean() / first.num_blocks).item(),
+            "mean_active_bit": selected_bits.mean().item(),
+            "mean_weight_bits_per_token": costs_cat.mean().item(),
+            "mean_weight_bit_fraction": (costs_cat.mean() / max_bits_per_token).item(),
+            "router_entropy": entropy_cat.mean().item(),
+            "mode_fractions": {
+                f"{blocks}x{bits}": fractions[i].item()
+                for i, (blocks, bits) in enumerate(modes)
+            },
+            "mode_prob_means": {
+                f"{blocks}x{bits}": prob_means[i].item()
+                for i, (blocks, bits) in enumerate(modes)
+            },
+            "layers": layer_stats,
+        }
+
     def _forward_dynamic_inference(self, idx, pos):
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
@@ -1467,6 +1753,7 @@ class GPT(nn.Module):
             self._set_dynamic_width_stats(self._dynamic_width_modules())
             self._set_free_channel_stats(self._free_channel_modules())
             self._set_block_precision_stats(self._block_precision_modules())
+            self._set_resource_mode_stats(self._resource_mode_modules())
 
         return final_logits, None
 
@@ -1540,6 +1827,11 @@ class GPT(nn.Module):
             if block_precision_cost is not None:
                 loss = loss + self.config.block_precision_cost_weight * block_precision_cost
             self._set_block_precision_stats(block_precision_modules, valid_mask=targets != -1)
+            resource_mode_modules = self._resource_mode_modules()
+            resource_mode_cost = self._resource_mode_loss_terms(resource_mode_modules, targets != -1)
+            if resource_mode_cost is not None:
+                loss = loss + self.config.resource_mode_cost_weight * resource_mode_cost
+            self._set_resource_mode_stats(resource_mode_modules, valid_mask=targets != -1)
             self.last_loss_stats = {
                 "task_loss": task_loss.detach().item(),
                 "total_loss": loss.detach().item(),
@@ -1558,6 +1850,8 @@ class GPT(nn.Module):
                 self.last_loss_stats["free_channel_cost"] = free_channel_cost.detach().item()
             if block_precision_cost is not None:
                 self.last_loss_stats["block_precision_cost"] = block_precision_cost.detach().item()
+            if resource_mode_cost is not None:
+                self.last_loss_stats["resource_mode_cost"] = resource_mode_cost.detach().item()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             loss = None
@@ -1569,6 +1863,7 @@ class GPT(nn.Module):
             self._set_dynamic_width_stats(self._dynamic_width_modules())
             self._set_free_channel_stats(self._free_channel_modules())
             self._set_block_precision_stats(self._block_precision_modules())
+            self._set_resource_mode_stats(self._resource_mode_modules())
 
         return logits, loss
 

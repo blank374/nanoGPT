@@ -1,0 +1,3 @@
+path,mean_ms,median_ms,tokens_per_second,mean_active_blocks,mean_active_channels,mean_active_bit,mean_weight_bits_per_token,mean_weight_bit_fraction,checkpoint,iter,batch_size,block_size,tokens,max_abs_diff_vs_dense_mask
+dense_mask,0.5040020900025866,0.5012499999565989,1984.1187563227525,4.0,64.0,10.0,40960.0,0.3125,ckpt.pt,1,1,1,1,0.0
+grouped,0.37391125999988617,0.37387450004189304,2674.431361067608,4.0,64.0,10.0,40960.0,0.3125,ckpt.pt,1,1,1,1,2.9802322387695312e-08
