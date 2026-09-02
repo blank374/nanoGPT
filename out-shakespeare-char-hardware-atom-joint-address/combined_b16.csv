@@ -1,0 +1,3 @@
+path,mean_ms,tokens_per_second,batch_size,block_size,tokens,dtype,accepted_fraction,graph_cache_entries,max_abs_diff_vs_dynamic,next_token_argmax_agreement
+dynamic_layered,11.193738000001758,91479.71839253689,16,64,1024,float16,0.8125,2,1.130859375,1.0
+direct_address_graph_dispatch,16.651310000161175,61496.66302471627,16,64,1024,float16,0.8125,2,1.130859375,1.0

@@ -805,12 +805,227 @@ class ResourceModeMLP(nn.Module):
             return self._forward_grouped_sliced(x, self.last_selected_mode)
         return self._forward_dense_mask(x, mode_onehot)
 
+class HardwareAtomMLP(nn.Module):
+    """Retrieval-routed MLP built from GPU-aligned prefix atoms."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.max_hidden = 4 * config.n_embd
+        self.atom_size = int(config.hardware_atom_size)
+        assert self.atom_size > 0 and self.max_hidden % self.atom_size == 0, \
+            f"max hidden {self.max_hidden} must be divisible by atom size {self.atom_size}"
+        self.num_atoms = self.max_hidden // self.atom_size
+        atom_choices = sorted(set(int(value) for value in config.hardware_atom_choices))
+        assert atom_choices and all(1 <= value <= self.num_atoms for value in atom_choices), \
+            f"hardware_atom_choices must be within [1, {self.num_atoms}]"
+        assert atom_choices[-1] == self.num_atoms, \
+            "hardware_atom_choices must include the full-width fallback"
+        self.atom_choices = atom_choices
+        self.width_choices = [value * self.atom_size for value in atom_choices]
+        self.c_fc = nn.Linear(config.n_embd, self.max_hidden, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(self.max_hidden, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+        search_dim = int(config.hardware_atom_search_dim)
+        assert 1 <= search_dim <= config.n_embd
+        self.search_dim = search_dim
+        self.query_proj = nn.Linear(config.n_embd, search_dim, bias=False)
+        self.mode_keys = nn.Parameter(torch.empty(len(atom_choices), search_dim))
+        self.mode_bias = nn.Parameter(torch.zeros(len(atom_choices)))
+        nn.init.normal_(self.mode_keys, mean=0.0, std=1.0 / math.sqrt(search_dim))
+        self.routing = config.hardware_atom_routing
+        self.route_scope = config.hardware_atom_route_scope
+        self.temperature = config.hardware_atom_temperature
+        self.eval_impl = config.hardware_atom_eval_impl
+        self.register_buffer("mode_costs", torch.tensor(self.width_choices, dtype=torch.float32) / self.max_hidden)
+        self.force_mode_index = None
+        # Exact sequence-route cache. Each entry is a GPU tensor containing
+        # the batch rows assigned to one hardware width. It is built once
+        # during request prefill and reused without a per-step nonzero().
+        self.cached_sequence_modes = None
+        self.cached_sequence_indices = None
+        self.last_query = None
+        self.last_mode_probs = None
+        self.last_mode_onehot = None
+        self.last_selected_mode = None
+        self.last_cost_ratio = None
+        self.last_router_entropy = None
+        self.runtime_stats_enabled = True
+        self.external_mode_probs = None
+
+    def _route(self, x):
+        # The full hidden state becomes a short address; learned keys form the
+        # small searchable codebook. Search never scans individual channels.
+        if self.external_mode_probs is None:
+            query = F.normalize(self.query_proj(x), dim=-1)
+            if self.route_scope == "sequence":
+                # One address per request/sequence. Training and inference now use
+                # the same route granularity, so the chosen subnetwork can be
+                # cached and reused during autoregressive decoding.
+                query = F.normalize(query.mean(dim=1, keepdim=True), dim=-1)
+            keys = F.normalize(self.mode_keys, dim=-1)
+            logits = F.linear(query, keys, self.mode_bias) / self.temperature
+            probs = F.softmax(logits, dim=-1)
+        else:
+            query = None
+            probs = self.external_mode_probs
+            if probs.dim() == 2:
+                probs = probs[:, None, :]
+            if probs.shape[:2] != x.shape[:2]:
+                raise ValueError(
+                    f"external token routes have shape {tuple(probs.shape[:2])}, "
+                    f"expected {tuple(x.shape[:2])}"
+                )
+        if self.force_mode_index is None:
+            selected = probs.argmax(dim=-1)
+            hard = F.one_hot(selected, num_classes=len(self.atom_choices)).to(probs.dtype)
+        else:
+            selected = torch.full(x.shape[:2], int(self.force_mode_index), dtype=torch.long, device=x.device)
+            hard = F.one_hot(selected, num_classes=len(self.atom_choices)).to(probs.dtype)
+            probs = hard
+        if self.route_scope == "sequence" and x.size(1) != 1:
+            probs = probs.expand(-1, x.size(1), -1)
+            selected = selected.expand(-1, x.size(1))
+            hard = hard.expand(-1, x.size(1), -1)
+        if self.routing == "soft":
+            mode_onehot = probs
+        elif self.training:
+            mode_onehot = hard + probs - probs.detach()
+        else:
+            mode_onehot = hard
+        self.last_query = query.detach() if query is not None else None
+        self.last_mode_probs = probs
+        self.last_mode_onehot = mode_onehot
+        self.last_selected_mode = selected.detach()
+        self.last_cost_ratio = torch.matmul(mode_onehot.float(), self.mode_costs.to(x.device))
+        self.last_router_entropy = -(probs.float() * torch.log(probs.float().clamp_min(1e-9))).sum(dim=-1)
+        return mode_onehot, selected
+
+    def _prefix_linear(self, x, width):
+        fc_bias = self.c_fc.bias[:width] if self.c_fc.bias is not None else None
+        hidden = F.linear(x, self.c_fc.weight[:width], fc_bias)
+        hidden = self.gelu(hidden)
+        return F.linear(hidden, self.c_proj.weight[:, :width], None)
+
+    def _forward_dense_full(self, x):
+        hidden = self.gelu(self.c_fc(x))
+        return self.dropout(self.c_proj(hidden))
+
+    def _forward_dense_mask(self, x, mode_onehot):
+        out = torch.zeros_like(x)
+        for mode_idx, width in enumerate(self.width_choices):
+            mode_out = self._prefix_linear(x, width)
+            out = out + mode_onehot[..., mode_idx].unsqueeze(-1).to(mode_out.dtype) * mode_out
+        if self.c_proj.bias is not None:
+            out = out + self.c_proj.bias
+        return self.dropout(out)
+
+    def _forward_grouped(self, x, selected):
+        B, T, C = x.shape
+        x_flat = x.reshape(B * T, C)
+        selected_flat = selected.reshape(B * T)
+        out_flat = torch.zeros_like(x_flat)
+        for mode_idx, width in enumerate(self.width_choices):
+            token_idx = (selected_flat == mode_idx).nonzero(as_tuple=False).flatten()
+            if token_idx.numel() == 0:
+                continue
+            mode_out = self._prefix_linear(x_flat.index_select(0, token_idx), width)
+            # Autocast may produce FP16/BF16 GEMM output while the residual
+            # buffer follows the FP32 input dtype. index_copy_ does not cast.
+            out_flat.index_copy_(0, token_idx, mode_out.to(out_flat.dtype))
+        if self.c_proj.bias is not None:
+            out_flat = out_flat + self.c_proj.bias
+        return self.dropout(out_flat.view(B, T, C))
+
+    def clear_cached_sequence_routes(self):
+        self.cached_sequence_modes = None
+        self.cached_sequence_indices = None
+
+    def cache_sequence_routes(self, selected=None):
+        """Cache exact per-request route buckets after a sequence prefill."""
+        assert self.route_scope == "sequence", \
+            "exact request route caching requires hardware_atom_route_scope='sequence'"
+        selected = self.last_selected_mode if selected is None else selected
+        assert selected is not None, "run one routed prefill before caching routes"
+        modes = selected[:, 0].detach().clone()
+        self.cached_sequence_modes = modes
+        self.cached_sequence_indices = [
+            (modes == mode_idx).nonzero(as_tuple=False).flatten()
+            for mode_idx in range(len(self.width_choices))
+        ]
+
+    def _forward_cached_sequence(self, x):
+        """Execute cached request buckets with one sliced GEMM per used mode."""
+        B, T, _ = x.shape
+        if self.cached_sequence_modes.numel() != B:
+            raise ValueError(
+                f"cached route batch size {self.cached_sequence_modes.numel()} "
+                f"does not match input batch size {B}"
+            )
+        selected = self.cached_sequence_modes[:, None].expand(B, T)
+        if self.runtime_stats_enabled:
+            hard = F.one_hot(selected, num_classes=len(self.atom_choices)).to(x.dtype)
+            self.last_mode_probs = hard
+            self.last_mode_onehot = hard
+            self.last_selected_mode = selected
+            self.last_cost_ratio = self.mode_costs[selected].to(device=x.device)
+            self.last_router_entropy = torch.zeros((B, T), dtype=torch.float32, device=x.device)
+
+        out = torch.zeros_like(x)
+        for width, batch_idx in zip(self.width_choices, self.cached_sequence_indices):
+            if batch_idx.numel() == 0:
+                continue
+            mode_out = self._prefix_linear(x.index_select(0, batch_idx), width)
+            out.index_copy_(0, batch_idx, mode_out.to(out.dtype))
+        if self.c_proj.bias is not None:
+            out = out + self.c_proj.bias
+        return self.dropout(out)
+
+    def forward(self, x):
+        if not self.training and self.eval_impl == "dense_full":
+            # No router here: this is the ordinary dense MLP hardware baseline.
+            full_idx = len(self.atom_choices) - 1
+            self.last_selected_mode = torch.full(x.shape[:2], full_idx, dtype=torch.long, device=x.device)
+            self.last_cost_ratio = torch.ones(x.shape[:2], dtype=torch.float32, device=x.device)
+            self.last_mode_probs = None
+            self.last_mode_onehot = None
+            self.last_router_entropy = None
+            return self._forward_dense_full(x)
+        if not self.training and self.eval_impl == "grouped" and self.force_mode_index is not None:
+            # Cached-route fast path: the mode is already known on the host, so
+            # inference avoids GPU nonzero/index dispatch and launches one
+            # contiguous sliced GEMM directly. This measures the executable
+            # atom itself and supports request-level route caching.
+            mode_idx = int(self.force_mode_index)
+            selected = torch.full(x.shape[:2], mode_idx, dtype=torch.long, device=x.device)
+            hard = F.one_hot(selected, num_classes=len(self.atom_choices)).to(x.dtype)
+            self.last_mode_probs = hard
+            self.last_mode_onehot = hard
+            self.last_selected_mode = selected
+            self.last_cost_ratio = torch.full(
+                x.shape[:2], self.width_choices[mode_idx] / self.max_hidden,
+                dtype=torch.float32, device=x.device
+            )
+            self.last_router_entropy = torch.zeros(x.shape[:2], dtype=torch.float32, device=x.device)
+            out = self._prefix_linear(x, self.width_choices[mode_idx])
+            if self.c_proj.bias is not None:
+                out = out + self.c_proj.bias
+            return self.dropout(out)
+        if (not self.training and self.eval_impl == "grouped"
+                and self.cached_sequence_indices is not None):
+            return self._forward_cached_sequence(x)
+        mode_onehot, selected = self._route(x)
+        if not self.training and self.eval_impl == "grouped" and self.routing == "ste":
+            return self._forward_grouped(x, selected)
+        return self._forward_dense_mask(x, mode_onehot)
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp]) <= 1, \
-            "dynamic_mlp, dynamic_width, free_channel_mlp, block_sparse_mlp, block_precision_mlp, and resource_mode_mlp are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp, config.hardware_atom_mlp]) <= 1, \
+            "dynamic MLP variants are mutually exclusive"
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
@@ -820,6 +1035,7 @@ class Block(nn.Module):
         self.block_sparse_mlp = config.block_sparse_mlp
         self.block_precision_mlp = config.block_precision_mlp
         self.resource_mode_mlp = config.resource_mode_mlp
+        self.hardware_atom_mlp = config.hardware_atom_mlp
         if config.dynamic_mlp:
             self.mlp = FastSlowMLP(config)
         elif config.dynamic_width:
@@ -832,6 +1048,8 @@ class Block(nn.Module):
             self.mlp = BlockPrecisionMLP(config)
         elif config.resource_mode_mlp:
             self.mlp = ResourceModeMLP(config)
+        elif config.hardware_atom_mlp:
+            self.mlp = HardwareAtomMLP(config)
         else:
             self.mlp = MLP(config)
 
@@ -860,6 +1078,20 @@ class EarlyExitHead(nn.Module):
 
     def forward(self, x):
         return self.proj(self.ln(x))
+
+
+class HardwareAtomAddressHead(nn.Module):
+    """Predict all layer routes once from the transformer's initial state."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_layers = config.n_layer
+        self.num_modes = len(config.hardware_atom_choices)
+        self.proj = nn.Linear(config.n_embd, self.num_layers * self.num_modes)
+
+    def forward(self, x):
+        summary = F.normalize(x.mean(dim=1).float(), dim=-1)
+        return self.proj(summary).view(-1, self.num_layers, self.num_modes)
 
 @dataclass
 class GPTConfig:
@@ -940,6 +1172,21 @@ class GPTConfig:
     resource_mode_temperature_anneal_iters: int = 0
     resource_mode_sliced_eval: bool = True
     resource_mode_eval_impl: str = "grouped" # "dense_mask" or "grouped"
+    hardware_atom_mlp: bool = False
+    hardware_atom_size: int = 64
+    hardware_atom_choices: list = None
+    hardware_atom_search_dim: int = 16
+    hardware_atom_routing: str = "ste" # "soft" or "ste"
+    hardware_atom_route_scope: str = "token" # "token" or "sequence"
+    hardware_atom_cost_weight: float = 0.01
+    hardware_atom_temperature: float = 1.0
+    hardware_atom_temperature_final: float = 0.5
+    hardware_atom_temperature_anneal_iters: int = 1000
+    hardware_atom_eval_impl: str = "grouped" # "dense_full", "dense_mask", or "grouped"
+    hardware_atom_direct_address: bool = False
+    hardware_atom_address_loss_weight: float = 0.1
+    hardware_atom_address_agreement_weight: float = 0.05
+    hardware_atom_address_task_weight: float = 0.0
 
 class GPT(nn.Module):
 
@@ -947,14 +1194,21 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp]) <= 1, \
-            "dynamic_mlp, dynamic_width, free_channel_mlp, block_sparse_mlp, block_precision_mlp, and resource_mode_mlp are mutually exclusive"
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp, config.hardware_atom_mlp]) <= 1, \
+            "dynamic MLP variants are mutually exclusive"
         if config.dynamic_width_ratios is None:
             config.dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
         if config.block_precision_bit_choices is None:
             config.block_precision_bit_choices = [2, 4, 8, 16]
         if config.resource_mode_choices is None:
             config.resource_mode_choices = [(4, 2), (8, 4), (12, 4), (16, 8), (32, 16)]
+        if not config.hardware_atom_choices:
+            assert (4 * config.n_embd) % config.hardware_atom_size == 0, \
+                "4*n_embd must be divisible by hardware_atom_size"
+            atom_count = (4 * config.n_embd) // config.hardware_atom_size
+            config.hardware_atom_choices = sorted(set([
+                max(1, atom_count // 4), max(1, atom_count // 2), atom_count
+            ]))
         assert config.dynamic_width_routing in ("soft", "ste"), "dynamic_width_routing must be 'soft' or 'ste'"
         assert config.free_channel_routing in ("soft", "ste"), "free_channel_routing must be 'soft' or 'ste'"
         assert config.free_channel_eval_impl in ("dense_mask", "prefix_sliced", "prefix_cover_sliced"), \
@@ -967,6 +1221,12 @@ class GPT(nn.Module):
         assert config.resource_mode_routing in ("soft", "ste"), "resource_mode_routing must be 'soft' or 'ste'"
         assert config.resource_mode_eval_impl in ("dense_mask", "grouped"), \
             "resource_mode_eval_impl must be 'dense_mask' or 'grouped'"
+        assert config.hardware_atom_routing in ("soft", "ste"), \
+            "hardware_atom_routing must be 'soft' or 'ste'"
+        assert config.hardware_atom_route_scope in ("token", "sequence"), \
+            "hardware_atom_route_scope must be 'token' or 'sequence'"
+        assert config.hardware_atom_eval_impl in ("dense_full", "dense_mask", "grouped"), \
+            "hardware_atom_eval_impl must be 'dense_full', 'dense_mask', or 'grouped'"
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -982,6 +1242,10 @@ class GPT(nn.Module):
         if config.dynamic_exit:
             for layer_idx in self.exit_layers:
                 self.exit_heads[str(layer_idx)] = EarlyExitHead(config)
+        self.hardware_atom_address = (
+            HardwareAtomAddressHead(config)
+            if config.hardware_atom_mlp and config.hardware_atom_direct_address else None
+        )
         self.last_exit_stats = None
         self.last_exit_details = None
         self.last_dynamic_mlp_stats = None
@@ -989,6 +1253,9 @@ class GPT(nn.Module):
         self.last_free_channel_stats = None
         self.last_block_precision_stats = None
         self.last_resource_mode_stats = None
+        self.last_hardware_atom_stats = None
+        self.last_hardware_atom_address_logits = None
+        self.last_hardware_atom_address_stats = None
         self.last_loss_stats = None
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -1062,6 +1329,23 @@ class GPT(nn.Module):
                 f"cost_weight={config.resource_mode_cost_weight}, "
                 f"sliced_eval={config.resource_mode_sliced_eval}"
             )
+        if config.hardware_atom_mlp:
+            print(
+                "hardware-atom MLP enabled: "
+                f"atom_size={config.hardware_atom_size}, "
+                f"atom_choices={config.hardware_atom_choices}, "
+                f"search_dim={config.hardware_atom_search_dim}, "
+                f"route_scope={config.hardware_atom_route_scope}, "
+                f"cost_weight={config.hardware_atom_cost_weight}, "
+                f"eval_impl={config.hardware_atom_eval_impl}"
+            )
+            if config.hardware_atom_direct_address:
+                print(
+                    "hardware-atom direct address enabled: "
+                    f"address_loss_weight={config.hardware_atom_address_loss_weight}, "
+                    f"agreement_weight={config.hardware_atom_address_agreement_weight}, "
+                    f"task_weight={config.hardware_atom_address_task_weight}"
+                )
 
     def _normalize_exit_layers(self, exit_layers):
         if exit_layers is None:
@@ -1177,8 +1461,10 @@ class GPT(nn.Module):
             if isinstance(block.mlp, AdaptiveWidthMLP):
                 block.mlp.force_hard = force_hard
 
-    def _forward_logits(self, idx, targets=None, force_hard_width=False):
+    def _forward_logits(self, idx, targets=None, force_hard_width=False,
+                        use_direct_address=False, compute_address=True):
         old_force = []
+        direct_modules = []
         if force_hard_width:
             for block in self.transformer.h:
                 if isinstance(block.mlp, AdaptiveWidthMLP):
@@ -1192,6 +1478,16 @@ class GPT(nn.Module):
             tok_emb = self.transformer.wte(idx)
             pos_emb = self.transformer.wpe(pos)
             x = self.transformer.drop(tok_emb + pos_emb)
+            if compute_address:
+                self.last_hardware_atom_address_logits = (
+                    self.hardware_atom_address(x) if self.hardware_atom_address is not None else None
+                )
+            if use_direct_address:
+                assert self.last_hardware_atom_address_logits is not None
+                address_probs = self.last_hardware_atom_address_logits.softmax(dim=-1)
+                direct_modules = [mlp for _, mlp in self._hardware_atom_modules()]
+                for layer, mlp in enumerate(direct_modules):
+                    mlp.external_mode_probs = address_probs[:, layer, :]
             exit_outputs = []
             for layer_idx, block in enumerate(self.transformer.h, start=1):
                 x = block(x)
@@ -1202,11 +1498,15 @@ class GPT(nn.Module):
             if targets is not None:
                 logits = self.lm_head(x)
             else:
-                logits = self.lm_head(x[:, [-1], :])
+                # Basic slicing is CUDA-Graph-safe and avoids the temporary
+                # index tensor created by list-based advanced indexing.
+                logits = self.lm_head(x[:, -1:, :])
             return logits, exit_outputs
         finally:
             for mlp, force in old_force:
                 mlp.force_hard = force
+            for mlp in direct_modules:
+                mlp.external_mode_probs = None
 
     def _dynamic_width_loss_terms(self, modules, valid_mask):
         if not modules:
@@ -1681,6 +1981,116 @@ class GPT(nn.Module):
             "layers": layer_stats,
         }
 
+    def _hardware_atom_modules(self):
+        modules = []
+        for layer_idx, block in enumerate(self.transformer.h, start=1):
+            if isinstance(block.mlp, HardwareAtomMLP) and block.mlp.last_selected_mode is not None:
+                modules.append((layer_idx, block.mlp))
+        return modules
+
+    def set_hardware_atom_temperature(self, temperature):
+        if not self.config.hardware_atom_mlp:
+            return
+        self.config.hardware_atom_temperature = temperature
+        for block in self.transformer.h:
+            if isinstance(block.mlp, HardwareAtomMLP):
+                block.mlp.temperature = temperature
+
+    def _hardware_atom_loss_terms(self, modules, valid_mask):
+        if not modules or any(mlp.last_mode_onehot is None for _, mlp in modules):
+            return None
+        costs = torch.stack([mlp.last_cost_ratio for _, mlp in modules])
+        if valid_mask is not None:
+            valid = valid_mask.unsqueeze(0)
+            costs = costs[valid.expand_as(costs)]
+        return costs.float().mean()
+
+    def _hardware_atom_address_loss_terms(self, modules):
+        logits = self.last_hardware_atom_address_logits
+        if logits is None or not modules or any(mlp.last_mode_probs is None for _, mlp in modules):
+            return None, None
+        teacher_probs = torch.stack(
+            [mlp.last_mode_probs[:, 0, :] for _, mlp in modules], dim=1
+        ).float()
+        teacher_routes = teacher_probs.detach().argmax(dim=-1)
+        prediction_loss = F.cross_entropy(logits.flatten(0, 1), teacher_routes.flatten())
+
+        # Pull the original layer routers toward the cheap early prediction as
+        # well. Detaching the address distribution gives each side a distinct
+        # target and avoids the two losses cancelling through each other.
+        address_probs = logits.detach().softmax(dim=-1)
+        agreement_loss = -(address_probs * teacher_probs.clamp_min(1e-9).log()).sum(dim=-1).mean()
+        return prediction_loss, agreement_loss
+
+    def _set_hardware_atom_address_stats(self, modules):
+        logits = self.last_hardware_atom_address_logits
+        if logits is None or not modules:
+            self.last_hardware_atom_address_stats = None
+            return
+        predicted = logits.detach().argmax(dim=-1)
+        selected = torch.stack([mlp.last_selected_mode[:, 0] for _, mlp in modules], dim=1)
+        correct = predicted == selected
+        confidence = logits.detach().softmax(dim=-1).max(dim=-1).values.min(dim=1).values
+        self.last_hardware_atom_address_stats = {
+            "exact_plan_accuracy": correct.all(dim=1).float().mean().item(),
+            "mean_layer_accuracy": correct.float().mean().item(),
+            "per_layer_accuracy": correct.float().mean(dim=0).tolist(),
+            "mean_min_confidence": confidence.mean().item(),
+        }
+
+    def _set_hardware_atom_stats(self, modules, valid_mask=None):
+        if not modules:
+            self.last_hardware_atom_stats = None
+            return
+        choices = modules[0][1].atom_choices
+        widths = modules[0][1].width_choices
+        all_selected = []
+        all_costs = []
+        all_entropy = []
+        layer_stats = []
+        for layer_idx, mlp in modules:
+            selected = mlp.last_selected_mode.detach()
+            costs = mlp.last_cost_ratio.detach().float()
+            entropy = mlp.last_router_entropy
+            if valid_mask is not None:
+                selected_values = selected[valid_mask]
+                cost_values = costs[valid_mask]
+                entropy_values = entropy.detach().float()[valid_mask] if entropy is not None else None
+            else:
+                selected_values = selected.reshape(-1)
+                cost_values = costs.reshape(-1)
+                entropy_values = entropy.detach().float().reshape(-1) if entropy is not None else None
+            fractions = torch.bincount(selected_values, minlength=len(choices)).float()
+            fractions = fractions / fractions.sum().clamp_min(1.0)
+            layer_stats.append({
+                "layer": layer_idx,
+                "mean_active_atoms": sum(choices[i] * fractions[i].item() for i in range(len(choices))),
+                "mean_active_ratio": cost_values.mean().item(),
+                "router_entropy": entropy_values.mean().item() if entropy_values is not None else 0.0,
+                "mode_fractions": {str(widths[i]): fractions[i].item() for i in range(len(widths))},
+            })
+            all_selected.append(selected_values)
+            all_costs.append(cost_values)
+            if entropy_values is not None:
+                all_entropy.append(entropy_values)
+        selected_cat = torch.cat(all_selected)
+        costs_cat = torch.cat(all_costs)
+        fractions = torch.bincount(selected_cat, minlength=len(choices)).float()
+        fractions = fractions / fractions.sum().clamp_min(1.0)
+        mean_atoms = sum(choices[i] * fractions[i].item() for i in range(len(choices)))
+        self.last_hardware_atom_stats = {
+            "atom_size": modules[0][1].atom_size,
+            "atom_choices": choices,
+            "width_choices": widths,
+            "search_dim": modules[0][1].search_dim,
+            "mean_active_atoms": mean_atoms,
+            "mean_active_channels": mean_atoms * modules[0][1].atom_size,
+            "mean_active_ratio": costs_cat.mean().item(),
+            "router_entropy": torch.cat(all_entropy).mean().item() if all_entropy else 0.0,
+            "mode_fractions": {str(widths[i]): fractions[i].item() for i in range(len(widths))},
+            "layers": layer_stats,
+        }
+
     def _forward_dynamic_inference(self, idx, pos):
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
@@ -1754,6 +2164,7 @@ class GPT(nn.Module):
             self._set_free_channel_stats(self._free_channel_modules())
             self._set_block_precision_stats(self._block_precision_modules())
             self._set_resource_mode_stats(self._resource_mode_modules())
+            self._set_hardware_atom_stats(self._hardware_atom_modules())
 
         return final_logits, None
 
@@ -1832,6 +2243,28 @@ class GPT(nn.Module):
             if resource_mode_cost is not None:
                 loss = loss + self.config.resource_mode_cost_weight * resource_mode_cost
             self._set_resource_mode_stats(resource_mode_modules, valid_mask=targets != -1)
+            hardware_atom_modules = self._hardware_atom_modules()
+            hardware_atom_cost = self._hardware_atom_loss_terms(hardware_atom_modules, targets != -1)
+            if hardware_atom_cost is not None:
+                loss = loss + self.config.hardware_atom_cost_weight * hardware_atom_cost
+            address_loss, address_agreement_loss = self._hardware_atom_address_loss_terms(hardware_atom_modules)
+            if address_loss is not None:
+                loss = loss + self.config.hardware_atom_address_loss_weight * address_loss
+            if address_agreement_loss is not None:
+                loss = loss + self.config.hardware_atom_address_agreement_weight * address_agreement_loss
+            self._set_hardware_atom_stats(hardware_atom_modules, valid_mask=targets != -1)
+            self._set_hardware_atom_address_stats(hardware_atom_modules)
+            address_task_loss = None
+            if (self.hardware_atom_address is not None
+                    and self.config.hardware_atom_address_task_weight != 0.0):
+                address_logits, _ = self._forward_logits(
+                    idx, targets, use_direct_address=True
+                )
+                address_task_loss = F.cross_entropy(
+                    address_logits.view(-1, address_logits.size(-1)),
+                    targets.view(-1), ignore_index=-1,
+                )
+                loss = loss + self.config.hardware_atom_address_task_weight * address_task_loss
             self.last_loss_stats = {
                 "task_loss": task_loss.detach().item(),
                 "total_loss": loss.detach().item(),
@@ -1852,6 +2285,14 @@ class GPT(nn.Module):
                 self.last_loss_stats["block_precision_cost"] = block_precision_cost.detach().item()
             if resource_mode_cost is not None:
                 self.last_loss_stats["resource_mode_cost"] = resource_mode_cost.detach().item()
+            if hardware_atom_cost is not None:
+                self.last_loss_stats["hardware_atom_cost"] = hardware_atom_cost.detach().item()
+            if address_loss is not None:
+                self.last_loss_stats["hardware_atom_address_loss"] = address_loss.detach().item()
+            if address_agreement_loss is not None:
+                self.last_loss_stats["hardware_atom_address_agreement_loss"] = address_agreement_loss.detach().item()
+            if address_task_loss is not None:
+                self.last_loss_stats["hardware_atom_address_task_loss"] = address_task_loss.detach().item()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             loss = None
@@ -1864,8 +2305,20 @@ class GPT(nn.Module):
             self._set_free_channel_stats(self._free_channel_modules())
             self._set_block_precision_stats(self._block_precision_modules())
             self._set_resource_mode_stats(self._resource_mode_modules())
+            self._set_hardware_atom_stats(self._hardware_atom_modules())
+            self._set_hardware_atom_address_stats(self._hardware_atom_modules())
 
         return logits, loss
+
+    def forward_inference_fast(self, idx, compute_address=False):
+        """Inference logits without Python-side diagnostic reductions.
+
+        This entry point is intended for CUDA Graph capture and serving loops.
+        Route diagnostics remain available through the normal ``forward``.
+        """
+        assert not self.training, "forward_inference_fast requires model.eval()"
+        logits, _ = self._forward_logits(idx, compute_address=compute_address)
+        return logits
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

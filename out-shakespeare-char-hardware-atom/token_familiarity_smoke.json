@@ -1,0 +1,81 @@
+{
+  "configuration": {
+    "out_dir": "out-shakespeare-char-hardware-atom",
+    "checkpoint": "ckpt.pt",
+    "dataset": "shakespeare_char",
+    "device": "cuda",
+    "dtype": "float16",
+    "block_size": 64,
+    "batch_size": 16,
+    "train_examples": 512,
+    "val_examples": 256,
+    "steps": 200,
+    "router_batch_size": 32,
+    "learning_rate": 0.003,
+    "bigram_buckets": 512,
+    "confidence": 0.7,
+    "quality_batches": 5,
+    "output_json": "out-shakespeare-char-hardware-atom\\token_familiarity_smoke.json",
+    "router_output": "out-shakespeare-char-hardware-atom\\token_familiarity_smoke.pt",
+    "seed": 1337
+  },
+  "train_loss": 0.4948023030161858,
+  "address_metrics": {
+    "per_layer_accuracy": [
+      0.93450927734375,
+      0.9022216796875,
+      0.934814453125,
+      0.9744873046875
+    ],
+    "exact_token_plan_accuracy": 0.77044677734375,
+    "accepted_token_fraction": 0.3360595703125,
+    "accepted_exact_accuracy": 0.972030520439148,
+    "mean_confidence": 0.6129451990127563,
+    "observed_token_plans": 57,
+    "top_k_plan_coverage": [
+      {
+        "k": 1,
+        "coverage": 0.15118408203125
+      },
+      {
+        "k": 2,
+        "coverage": 0.2635498046875
+      },
+      {
+        "k": 4,
+        "coverage": 0.41876220703125
+      },
+      {
+        "k": 8,
+        "coverage": 0.64300537109375
+      },
+      {
+        "k": 16,
+        "coverage": 0.878173828125
+      }
+    ]
+  },
+  "quality": {
+    "dynamic": {
+      "cross_entropy": 2.1159279346466064,
+      "perplexity": 8.297281529988375,
+      "mean_compute_ratio": 0.48507080078125
+    },
+    "token_direct": {
+      "cross_entropy": 2.1154284954071043,
+      "perplexity": 8.293138576673947,
+      "mean_compute_ratio": 0.4837646484375
+    },
+    "token_confident_dynamic_fallback": {
+      "cross_entropy": 2.1155986309051515,
+      "perplexity": 8.29454965396983,
+      "mean_compute_ratio": 0.484765625,
+      "accepted_token_fraction": 0.3291015625
+    }
+  },
+  "timing": {
+    "token_bigram_lookup_ms": 0.2054202000144869,
+    "four_layer_dynamic_router_ms": 2.459400799794821
+  },
+  "router_checkpoint": "out-shakespeare-char-hardware-atom\\token_familiarity_smoke.pt"
+}

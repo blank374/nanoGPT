@@ -132,6 +132,23 @@ resource_mode_temperature_final = 1.0
 resource_mode_temperature_anneal_iters = 0
 resource_mode_sliced_eval = True
 resource_mode_eval_impl = "grouped"
+# retrieval-routed, GPU-aligned prefix atoms
+hardware_atom_mlp = False
+hardware_atom_size = 64
+hardware_atom_choices = [] # auto: quarter, half, and full atom counts
+hardware_atom_search_dim = 16
+hardware_atom_routing = "ste"
+hardware_atom_route_scope = "token"
+hardware_atom_cost_weight = 0.01
+hardware_atom_temperature = 1.0
+hardware_atom_temperature_final = 0.5
+hardware_atom_temperature_anneal_iters = 1000
+hardware_atom_eval_impl = "grouped"
+hardware_atom_direct_address = False
+hardware_atom_address_loss_weight = 0.1
+hardware_atom_address_agreement_weight = 0.05
+hardware_atom_address_task_weight = 0.0
+resume_optimizer = True # set False when adding new trainable heads to an old checkpoint
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -292,7 +309,22 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   resource_mode_temperature_final=resource_mode_temperature_final,
                   resource_mode_temperature_anneal_iters=resource_mode_temperature_anneal_iters,
                   resource_mode_sliced_eval=resource_mode_sliced_eval,
-                  resource_mode_eval_impl=resource_mode_eval_impl) # start with model_args from command line
+                  resource_mode_eval_impl=resource_mode_eval_impl,
+                  hardware_atom_mlp=hardware_atom_mlp,
+                  hardware_atom_size=hardware_atom_size,
+                  hardware_atom_choices=hardware_atom_choices,
+                  hardware_atom_search_dim=hardware_atom_search_dim,
+                  hardware_atom_routing=hardware_atom_routing,
+                  hardware_atom_route_scope=hardware_atom_route_scope,
+                  hardware_atom_cost_weight=hardware_atom_cost_weight,
+                  hardware_atom_temperature=hardware_atom_temperature,
+                  hardware_atom_temperature_final=hardware_atom_temperature_final,
+                  hardware_atom_temperature_anneal_iters=hardware_atom_temperature_anneal_iters,
+                  hardware_atom_eval_impl=hardware_atom_eval_impl,
+                  hardware_atom_direct_address=hardware_atom_direct_address,
+                  hardware_atom_address_loss_weight=hardware_atom_address_loss_weight,
+                  hardware_atom_address_agreement_weight=hardware_atom_address_agreement_weight,
+                  hardware_atom_address_task_weight=hardware_atom_address_task_weight) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -347,7 +379,15 @@ elif init_from == 'resume':
               'resource_mode_routing', 'resource_mode_cost_weight',
               'resource_mode_temperature', 'resource_mode_temperature_final',
               'resource_mode_temperature_anneal_iters',
-              'resource_mode_sliced_eval', 'resource_mode_eval_impl']:
+              'resource_mode_sliced_eval', 'resource_mode_eval_impl',
+              'hardware_atom_mlp', 'hardware_atom_size', 'hardware_atom_choices',
+              'hardware_atom_search_dim', 'hardware_atom_routing',
+              'hardware_atom_route_scope',
+              'hardware_atom_cost_weight', 'hardware_atom_temperature',
+              'hardware_atom_temperature_final',
+              'hardware_atom_temperature_anneal_iters', 'hardware_atom_eval_impl',
+              'hardware_atom_direct_address', 'hardware_atom_address_loss_weight',
+              'hardware_atom_address_agreement_weight', 'hardware_atom_address_task_weight']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -389,7 +429,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
+if init_from == 'resume' and resume_optimizer:
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
@@ -463,6 +503,12 @@ def get_resource_mode_temperature(it):
     ratio = min(max(it / resource_mode_temperature_anneal_iters, 0.0), 1.0)
     return resource_mode_temperature + ratio * (resource_mode_temperature_final - resource_mode_temperature)
 
+def get_hardware_atom_temperature(it):
+    if not hardware_atom_mlp or hardware_atom_temperature_anneal_iters <= 0:
+        return hardware_atom_temperature
+    ratio = min(max(it / hardware_atom_temperature_anneal_iters, 0.0), 1.0)
+    return hardware_atom_temperature + ratio * (hardware_atom_temperature_final - hardware_atom_temperature)
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -490,6 +536,8 @@ while True:
         raw_model.set_block_precision_temperature(get_block_precision_temperature(iter_num))
     if resource_mode_mlp:
         raw_model.set_resource_mode_temperature(get_resource_mode_temperature(iter_num))
+    if hardware_atom_mlp:
+        raw_model.set_hardware_atom_temperature(get_hardware_atom_temperature(iter_num))
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -570,6 +618,30 @@ while True:
                 f"({100 * resource_mode_stats['mean_weight_bit_fraction']:.2f}%), "
                 f"entropy {resource_mode_stats['router_entropy']:.4f}, {mode_dist}"
             )
+        hardware_atom_stats = raw_model.last_hardware_atom_stats
+        if hardware_atom_stats is not None:
+            atom_dist = ", ".join(
+                f"w{width}={hardware_atom_stats['mode_fractions'][str(width)]:.3f}"
+                for width in hardware_atom_stats["width_choices"]
+            )
+            print(
+                f"  eval_hardware_atom: mean_atoms {hardware_atom_stats['mean_active_atoms']:.2f}, "
+                f"mean_active {hardware_atom_stats['mean_active_channels']:.2f} "
+                f"({100 * hardware_atom_stats['mean_active_ratio']:.2f}%), "
+                f"entropy {hardware_atom_stats['router_entropy']:.4f}, {atom_dist}"
+            )
+        hardware_atom_address_stats = raw_model.last_hardware_atom_address_stats
+        if hardware_atom_address_stats is not None:
+            layer_accuracy = ", ".join(
+                f"L{layer + 1}={value:.3f}"
+                for layer, value in enumerate(hardware_atom_address_stats["per_layer_accuracy"])
+            )
+            print(
+                f"  eval_direct_address: exact {hardware_atom_address_stats['exact_plan_accuracy']:.3f}, "
+                f"mean_layer {hardware_atom_address_stats['mean_layer_accuracy']:.3f}, "
+                f"min_conf {hardware_atom_address_stats['mean_min_confidence']:.3f}, "
+                f"{layer_accuracy}"
+            )
         if wandb_log:
             wandb_metrics = {
                 "iter": iter_num,
@@ -632,6 +704,22 @@ while True:
                 })
                 for mode in resource_mode_stats["modes"]:
                     wandb_metrics[f"resource_mode/mode_{mode}_fraction"] = resource_mode_stats["mode_fractions"][mode]
+            if hardware_atom_stats is not None:
+                wandb_metrics.update({
+                    "hardware_atom/mean_active_atoms": hardware_atom_stats["mean_active_atoms"],
+                    "hardware_atom/mean_active_channels": hardware_atom_stats["mean_active_channels"],
+                    "hardware_atom/mean_active_ratio": hardware_atom_stats["mean_active_ratio"],
+                    "hardware_atom/router_entropy": hardware_atom_stats["router_entropy"],
+                    "hardware_atom/temperature": raw_model.config.hardware_atom_temperature,
+                })
+                for width in hardware_atom_stats["width_choices"]:
+                    wandb_metrics[f"hardware_atom/width{width}_fraction"] = hardware_atom_stats["mode_fractions"][str(width)]
+            if hardware_atom_address_stats is not None:
+                wandb_metrics.update({
+                    "direct_address/exact_plan_accuracy": hardware_atom_address_stats["exact_plan_accuracy"],
+                    "direct_address/mean_layer_accuracy": hardware_atom_address_stats["mean_layer_accuracy"],
+                    "direct_address/mean_min_confidence": hardware_atom_address_stats["mean_min_confidence"],
+                })
             wandb.log(wandb_metrics)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -646,6 +734,8 @@ while True:
                     model_args['block_precision_temperature'] = raw_model.config.block_precision_temperature
                 if resource_mode_mlp:
                     model_args['resource_mode_temperature'] = raw_model.config.resource_mode_temperature
+                if hardware_atom_mlp:
+                    model_args['hardware_atom_temperature'] = raw_model.config.hardware_atom_temperature
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),

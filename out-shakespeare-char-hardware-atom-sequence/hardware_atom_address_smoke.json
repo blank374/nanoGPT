@@ -1,0 +1,102 @@
+{
+  "configuration": {
+    "out_dir": "out-shakespeare-char-hardware-atom-sequence",
+    "checkpoint": "ckpt.pt",
+    "dataset": "shakespeare_char",
+    "device": "cuda",
+    "dtype": "float16",
+    "block_size": 64,
+    "batch_size": 16,
+    "train_examples": 512,
+    "val_examples": 256,
+    "router_steps": 200,
+    "router_batch_size": 128,
+    "learning_rate": 0.003,
+    "quality_batches": 5,
+    "hot_k": 4,
+    "confidence": 0.7,
+    "output_json": "out-shakespeare-char-hardware-atom-sequence\\hardware_atom_address_smoke.json",
+    "seed": 1337
+  },
+  "route_space_size": 81,
+  "observed_train_plans": 12,
+  "hot_plans": [
+    {
+      "id": 4,
+      "count": 156,
+      "fraction": 0.3046875
+    },
+    {
+      "id": 15,
+      "count": 57,
+      "fraction": 0.111328125
+    },
+    {
+      "id": 12,
+      "count": 54,
+      "fraction": 0.10546875
+    },
+    {
+      "id": 3,
+      "count": 51,
+      "fraction": 0.099609375
+    }
+  ],
+  "top_k_coverage": [
+    {
+      "k": 1,
+      "coverage": 0.3046875
+    },
+    {
+      "k": 2,
+      "coverage": 0.416015625
+    },
+    {
+      "k": 4,
+      "coverage": 0.62109375
+    },
+    {
+      "k": 8,
+      "coverage": 0.908203125
+    }
+  ],
+  "router_train_loss": 0.4441902792453766,
+  "validation_address_metrics": {
+    "per_layer_accuracy": [
+      0.796875,
+      0.69140625,
+      0.87109375,
+      1.0
+    ],
+    "exact_plan_accuracy": 0.47265625,
+    "hot_prediction_fraction": 1.0,
+    "accepted_fraction": 0.07421875,
+    "accepted_exact_accuracy": 0.7894737124443054,
+    "mean_min_confidence": 0.6042078137397766
+  },
+  "quality": {
+    "dynamic": {
+      "cross_entropy": 2.1107487201690676,
+      "perplexity": 8.254419221720246
+    },
+    "predicted_all": {
+      "cross_entropy": 2.135669136047363,
+      "perplexity": 8.462707315247782,
+      "mean_compute_ratio": 0.38515625
+    },
+    "hot_confident_fallback": {
+      "cross_entropy": 2.149326467514038,
+      "perplexity": 8.579078162966285,
+      "mean_compute_ratio": 0.9625,
+      "accepted_fraction": 0.0625
+    },
+    "dense_full": {
+      "cross_entropy": 2.1527645587921143,
+      "perplexity": 8.608624579306097
+    }
+  },
+  "timing": {
+    "address_projection_ms": 0.1607746000518091,
+    "embedding_plus_address_ms": 0.3085740000824444
+  }
+}

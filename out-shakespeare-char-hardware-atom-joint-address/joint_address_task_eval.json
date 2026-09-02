@@ -1,0 +1,131 @@
+{
+  "configuration": {
+    "out_dir": "out-shakespeare-char-hardware-atom-joint-address",
+    "checkpoint": "ckpt.pt",
+    "dataset": "shakespeare_char",
+    "device": "cuda",
+    "dtype": "float16",
+    "block_size": 64,
+    "batch_size": 32,
+    "train_examples": 4096,
+    "val_examples": 1024,
+    "router_steps": 800,
+    "router_batch_size": 256,
+    "learning_rate": 0.003,
+    "quality_batches": 20,
+    "hot_k": 8,
+    "confidence": 0.7,
+    "output_json": "out-shakespeare-char-hardware-atom-joint-address\\joint_address_task_eval.json",
+    "router_output": null,
+    "use_model_address": true,
+    "seed": 1337
+  },
+  "route_space_size": 81,
+  "observed_train_plans": 17,
+  "hot_plans": [
+    {
+      "id": 4,
+      "count": 2600,
+      "fraction": 0.634765625
+    },
+    {
+      "id": 13,
+      "count": 503,
+      "fraction": 0.122802734375
+    },
+    {
+      "id": 12,
+      "count": 438,
+      "fraction": 0.10693359375
+    },
+    {
+      "id": 3,
+      "count": 147,
+      "fraction": 0.035888671875
+    },
+    {
+      "id": 31,
+      "count": 103,
+      "fraction": 0.025146484375
+    },
+    {
+      "id": 7,
+      "count": 82,
+      "fraction": 0.02001953125
+    },
+    {
+      "id": 15,
+      "count": 68,
+      "fraction": 0.0166015625
+    },
+    {
+      "id": 16,
+      "count": 62,
+      "fraction": 0.01513671875
+    }
+  ],
+  "top_k_coverage": [
+    {
+      "k": 1,
+      "coverage": 0.634765625
+    },
+    {
+      "k": 2,
+      "coverage": 0.757568359375
+    },
+    {
+      "k": 4,
+      "coverage": 0.900390625
+    },
+    {
+      "k": 8,
+      "coverage": 0.977294921875
+    },
+    {
+      "k": 16,
+      "coverage": 0.999755859375
+    }
+  ],
+  "router_train_loss": null,
+  "validation_address_metrics": {
+    "per_layer_accuracy": [
+      0.8154296875,
+      0.9033203125,
+      0.7548828125,
+      0.96875
+    ],
+    "exact_plan_accuracy": 0.5791015625,
+    "hot_prediction_fraction": 1.0,
+    "accepted_fraction": 0.6220703125,
+    "accepted_exact_accuracy": 0.8163265585899353,
+    "mean_min_confidence": 0.7458446621894836
+  },
+  "quality": {
+    "dynamic": {
+      "cross_entropy": 2.003702473640442,
+      "perplexity": 7.4164645926671415,
+      "mean_compute_ratio": 0.3775390625
+    },
+    "predicted_all": {
+      "cross_entropy": 2.0114176630973817,
+      "perplexity": 7.473905320222486,
+      "mean_compute_ratio": 0.3775390625
+    },
+    "hot_confident_dynamic_fallback": {
+      "cross_entropy": 2.0114176630973817,
+      "perplexity": 7.473905320222486,
+      "mean_compute_ratio": 0.3775390625,
+      "accepted_fraction": 0.640625
+    },
+    "dense_full": {
+      "cross_entropy": 2.0576733589172362,
+      "perplexity": 7.827736274295871
+    }
+  },
+  "timing": {
+    "address_projection_ms": 0.16199220009730197,
+    "embedding_plus_address_ms": 0.3304932002793066,
+    "layered_dynamic_address_ms": 2.9217534002673347
+  },
+  "router_checkpoint": "out-shakespeare-char-hardware-atom-joint-address\\ckpt.pt"
+}

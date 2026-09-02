@@ -1,0 +1,5 @@
+path,mean_ms,median_ms,tokens_per_second,mean_active_atoms,mean_active_channels,mean_active_ratio,router_entropy,batch_size,block_size,tokens,dtype,max_abs_diff_vs_eager
+eager_dense_full,11.233302000109688,11.235749998377287,91157.52429606192,8.0,512.0,1.0,0.0,16,64,1024,float16,
+graph_dense_full,7.049986999918474,6.699249999655876,145248.49478613812,,,,,16,64,1024,float16,0.0
+eager_grouped,9.489446000079624,9.423500001503271,107909.35529760197,8.0,512.0,1.0,0.0,16,64,1024,float16,
+graph_grouped,5.016745000211813,4.791450000993791,204116.41412046368,,,,,16,64,1024,float16,0.0

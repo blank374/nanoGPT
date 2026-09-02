@@ -1,0 +1,4 @@
+path,mean_ms,median_ms,tokens_per_second,mean_active_atoms,mean_active_channels,mean_active_ratio,router_entropy,checkpoint,iter,batch_size,block_size,tokens,dtype,max_abs_diff_grouped_vs_dense_mask,width_128_fraction,width_256_fraction,width_512_fraction
+dense_full,30.0258025000403,30.072300000028918,136416.00420153642,8.0,512.0,1.0,0.0,ckpt.pt,900,64,64,4096,float16,0.0,0.546875,0.3671875,0.0859375
+dense_mask,44.140461249799046,44.29964999872027,92794.68052723729,3.25,208.0,0.40625,0.6584240794181824,ckpt.pt,900,64,64,4096,float16,0.0,0.546875,0.3671875,0.0859375
+grouped,22.053345000267655,22.058449998439755,185731.4615968819,3.25,208.0,0.40625,0.0,ckpt.pt,900,64,64,4096,float16,0.0,0.546875,0.3671875,0.0859375
