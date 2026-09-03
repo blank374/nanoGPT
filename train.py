@@ -17,6 +17,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import os
+import csv
 import time
 import math
 import pickle
@@ -65,6 +66,40 @@ early_exit_loss_weight = 0.3
 use_distillation = False
 distillation_temperature = 2.0
 distillation_beta = 0.5
+# request-level dynamic prefix depth (independent from MLP width routing)
+enable_dynamic_depth = False
+enable_dynamic_width = False
+dynamic_depth_choices = [2, 3, 4]
+dynamic_depth_temperature = 1.0
+dynamic_depth_temperature_final = 0.5
+dynamic_depth_temperature_anneal_iters = 1000
+dynamic_depth_early_ce_weight = 0.3
+dynamic_depth_distill_weight = 0.3
+dynamic_depth_distill_temperature = 2.0
+dynamic_depth_router_quality_weight = 1.0
+dynamic_depth_compute_weight = 0.05
+dynamic_depth_compute_warmup_iters = 200
+dynamic_depth_compute_anneal_iters = 800
+dynamic_depth_entropy_weight = 0.01
+dynamic_depth_full_exploration = 0.05
+dynamic_depth_oracle_margin = 0.02
+dynamic_depth_inference_cost_bias = 0.0
+# unrestricted request-level per-layer resource routing
+dynamic_resource = False
+dynamic_resource_widths = [0, 64, 128, 256, 512]
+dynamic_resource_skip_mode = "mlp"
+dynamic_resource_routing = "gumbel"
+dynamic_resource_temperature = 1.5
+dynamic_resource_temperature_final = 0.5
+dynamic_resource_temperature_anneal_iters = 1000
+dynamic_resource_compute_penalty_max = 0.05
+dynamic_resource_compute_penalty_warmup_steps = 200
+dynamic_resource_compute_penalty_anneal_steps = 800
+dynamic_resource_distill_weight = 0.5
+dynamic_resource_distill_temperature = 2.0
+dynamic_resource_full_ce_weight = 0.5
+dynamic_resource_collapse_threshold = 0.95
+dynamic_resource_eval_impl = "physical"
 # dynamic MLP capacity routing
 dynamic_mlp = False
 dynamic_mlp_fast_ratio = 1.0
@@ -249,6 +284,38 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_distillation=use_distillation,
                   distillation_temperature=distillation_temperature,
                   distillation_beta=distillation_beta,
+                  enable_dynamic_depth=enable_dynamic_depth,
+                  enable_dynamic_width=enable_dynamic_width,
+                  dynamic_depth_choices=dynamic_depth_choices,
+                  dynamic_depth_temperature=dynamic_depth_temperature,
+                  dynamic_depth_temperature_final=dynamic_depth_temperature_final,
+                  dynamic_depth_temperature_anneal_iters=dynamic_depth_temperature_anneal_iters,
+                  dynamic_depth_early_ce_weight=dynamic_depth_early_ce_weight,
+                  dynamic_depth_distill_weight=dynamic_depth_distill_weight,
+                  dynamic_depth_distill_temperature=dynamic_depth_distill_temperature,
+                  dynamic_depth_router_quality_weight=dynamic_depth_router_quality_weight,
+                  dynamic_depth_compute_weight=dynamic_depth_compute_weight,
+                  dynamic_depth_compute_warmup_iters=dynamic_depth_compute_warmup_iters,
+                  dynamic_depth_compute_anneal_iters=dynamic_depth_compute_anneal_iters,
+                  dynamic_depth_entropy_weight=dynamic_depth_entropy_weight,
+                  dynamic_depth_full_exploration=dynamic_depth_full_exploration,
+                  dynamic_depth_oracle_margin=dynamic_depth_oracle_margin,
+                  dynamic_depth_inference_cost_bias=dynamic_depth_inference_cost_bias,
+                  dynamic_resource=dynamic_resource,
+                  dynamic_resource_widths=dynamic_resource_widths,
+                  dynamic_resource_skip_mode=dynamic_resource_skip_mode,
+                  dynamic_resource_routing=dynamic_resource_routing,
+                  dynamic_resource_temperature=dynamic_resource_temperature,
+                  dynamic_resource_temperature_final=dynamic_resource_temperature_final,
+                  dynamic_resource_temperature_anneal_iters=dynamic_resource_temperature_anneal_iters,
+                  dynamic_resource_compute_penalty_max=dynamic_resource_compute_penalty_max,
+                  dynamic_resource_compute_penalty_warmup_steps=dynamic_resource_compute_penalty_warmup_steps,
+                  dynamic_resource_compute_penalty_anneal_steps=dynamic_resource_compute_penalty_anneal_steps,
+                  dynamic_resource_distill_weight=dynamic_resource_distill_weight,
+                  dynamic_resource_distill_temperature=dynamic_resource_distill_temperature,
+                  dynamic_resource_full_ce_weight=dynamic_resource_full_ce_weight,
+                  dynamic_resource_collapse_threshold=dynamic_resource_collapse_threshold,
+                  dynamic_resource_eval_impl=dynamic_resource_eval_impl,
                   dynamic_mlp=dynamic_mlp,
                   dynamic_mlp_fast_ratio=dynamic_mlp_fast_ratio,
                   dynamic_mlp_slow_ratio=dynamic_mlp_slow_ratio,
@@ -348,7 +415,28 @@ elif init_from == 'resume':
     # command-line/default values so they can still be resumed unchanged.
     for k in ['dynamic_exit', 'exit_layers', 'confidence_method', 'confidence_threshold',
               'entropy_threshold', 'early_exit_loss_weight', 'use_distillation',
-              'distillation_temperature', 'distillation_beta', 'dynamic_mlp',
+              'distillation_temperature', 'distillation_beta',
+              'enable_dynamic_depth', 'enable_dynamic_width', 'dynamic_depth_choices',
+              'dynamic_depth_temperature', 'dynamic_depth_temperature_final',
+              'dynamic_depth_temperature_anneal_iters', 'dynamic_depth_early_ce_weight',
+              'dynamic_depth_distill_weight', 'dynamic_depth_distill_temperature',
+              'dynamic_depth_router_quality_weight', 'dynamic_depth_compute_weight',
+              'dynamic_depth_compute_warmup_iters', 'dynamic_depth_compute_anneal_iters',
+              'dynamic_depth_entropy_weight', 'dynamic_depth_full_exploration',
+              'dynamic_depth_oracle_margin',
+              'dynamic_depth_inference_cost_bias', 'dynamic_resource',
+              'dynamic_resource_widths', 'dynamic_resource_skip_mode',
+              'dynamic_resource_routing', 'dynamic_resource_temperature',
+              'dynamic_resource_temperature_final',
+              'dynamic_resource_temperature_anneal_iters',
+              'dynamic_resource_compute_penalty_max',
+              'dynamic_resource_compute_penalty_warmup_steps',
+              'dynamic_resource_compute_penalty_anneal_steps',
+              'dynamic_resource_distill_weight',
+              'dynamic_resource_distill_temperature',
+              'dynamic_resource_full_ce_weight',
+              'dynamic_resource_collapse_threshold', 'dynamic_resource_eval_impl',
+              'dynamic_mlp',
               'dynamic_mlp_fast_ratio', 'dynamic_mlp_slow_ratio',
               'dynamic_mlp_cost_weight', 'dynamic_mlp_threshold',
               'dynamic_mlp_hard_eval', 'dynamic_width', 'dynamic_width_ratios',
@@ -479,6 +567,71 @@ def get_dynamic_width_temperature(it):
     ratio = min(max(it / dynamic_width_temperature_anneal_iters, 0.0), 1.0)
     return dynamic_width_temperature + ratio * (dynamic_width_temperature_final - dynamic_width_temperature)
 
+def get_dynamic_depth_temperature(it):
+    if not enable_dynamic_depth or dynamic_depth_temperature_anneal_iters <= 0:
+        return dynamic_depth_temperature
+    ratio = min(max(it / dynamic_depth_temperature_anneal_iters, 0.0), 1.0)
+    return dynamic_depth_temperature + ratio * (dynamic_depth_temperature_final - dynamic_depth_temperature)
+
+def get_dynamic_depth_compute_weight(it):
+    if not enable_dynamic_depth or it < dynamic_depth_compute_warmup_iters:
+        return 0.0
+    if dynamic_depth_compute_anneal_iters <= 0:
+        return dynamic_depth_compute_weight
+    progress = (it - dynamic_depth_compute_warmup_iters) / dynamic_depth_compute_anneal_iters
+    return dynamic_depth_compute_weight * min(max(progress, 0.0), 1.0)
+
+def get_dynamic_resource_temperature(it):
+    if not dynamic_resource or dynamic_resource_temperature_anneal_iters <= 0:
+        return dynamic_resource_temperature
+    ratio = min(max(it / dynamic_resource_temperature_anneal_iters, 0.0), 1.0)
+    return (dynamic_resource_temperature
+            + ratio * (dynamic_resource_temperature_final - dynamic_resource_temperature))
+
+def get_dynamic_resource_compute_penalty(it):
+    if not dynamic_resource or it < dynamic_resource_compute_penalty_warmup_steps:
+        return 0.0
+    if dynamic_resource_compute_penalty_anneal_steps <= 0:
+        return dynamic_resource_compute_penalty_max
+    progress = ((it - dynamic_resource_compute_penalty_warmup_steps)
+                / dynamic_resource_compute_penalty_anneal_steps)
+    return dynamic_resource_compute_penalty_max * min(max(progress, 0.0), 1.0)
+
+def append_dynamic_resource_history(step, stats, loss_stats):
+    if not master_process or stats is None:
+        return
+    path = os.path.join(out_dir, "dynamic_resource_history.csv")
+    os.makedirs(out_dir, exist_ok=True)
+    fields = [
+        "step", "ppl", "full_ppl", "average_compute", "expected_compute",
+        "average_active_layers", "average_width", "unique_paths",
+        "top1_coverage", "top4_coverage", "top8_coverage", "top16_coverage",
+        "router_entropy", "router_confidence", "collapse_warning",
+    ]
+    row = {
+        "step": step,
+        "ppl": math.exp(min(loss_stats.get("dynamic_resource_ce", 100.0), 20.0)),
+        "full_ppl": math.exp(min(loss_stats.get("dynamic_resource_full_ce", 100.0), 20.0)),
+        "average_compute": stats["average_compute"],
+        "expected_compute": stats["expected_compute"],
+        "average_active_layers": stats["average_active_layers"],
+        "average_width": stats["average_width"],
+        "unique_paths": stats["observed_paths"],
+        "top1_coverage": stats["top1_coverage"],
+        "top4_coverage": stats["top4_coverage"],
+        "top8_coverage": stats["top8_coverage"],
+        "top16_coverage": stats["top16_coverage"],
+        "router_entropy": stats["router_entropy"],
+        "router_confidence": stats["router_confidence"],
+        "collapse_warning": stats["collapse_warning"] or "",
+    }
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
 def get_free_channel_temperature(it):
     if not free_channel_mlp or free_channel_temperature_anneal_iters <= 0:
         return free_channel_temperature
@@ -526,6 +679,14 @@ while True:
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+    if enable_dynamic_depth:
+        raw_model.set_dynamic_depth_temperature(get_dynamic_depth_temperature(iter_num))
+        raw_model.set_dynamic_depth_compute_weight(get_dynamic_depth_compute_weight(iter_num))
+    if dynamic_resource:
+        raw_model.set_dynamic_resource_temperature(get_dynamic_resource_temperature(iter_num))
+        raw_model.set_dynamic_resource_compute_penalty(
+            get_dynamic_resource_compute_penalty(iter_num)
+        )
     if dynamic_width:
         raw_model.set_dynamic_width_temperature(get_dynamic_width_temperature(iter_num))
     if free_channel_mlp:
@@ -543,6 +704,33 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        depth_stats = raw_model.last_dynamic_depth_stats
+        if depth_stats is not None:
+            depth_dist = ", ".join(
+                f"D{depth}={depth_stats['depth_fractions'][str(depth)]:.3f}"
+                for depth in depth_stats["depth_choices"]
+            )
+            print(
+                f"  eval_dynamic_depth: mean_depth {depth_stats['mean_depth']:.3f}, "
+                f"layer_savings {100 * depth_stats['theoretical_layer_savings']:.2f}%, "
+                f"entropy {depth_stats['router_entropy']:.4f}, {depth_dist}"
+            )
+        resource_stats = raw_model.last_dynamic_resource_stats
+        if resource_stats is not None:
+            print(
+                f"  eval_dynamic_resource: paths {resource_stats['observed_paths']}/"
+                f"{resource_stats['theoretical_paths']}, compute {resource_stats['average_compute']:.3f}/"
+                f"{n_layer}, active_layers {resource_stats['average_active_layers']:.3f}, "
+                f"mean_width {resource_stats['average_width']:.1f}, "
+                f"top1/4/8/16 {resource_stats['top1_coverage']:.3f}/"
+                f"{resource_stats['top4_coverage']:.3f}/{resource_stats['top8_coverage']:.3f}/"
+                f"{resource_stats['top16_coverage']:.3f}, entropy {resource_stats['router_entropy']:.4f}"
+            )
+            if resource_stats["collapse_warning"]:
+                print(f"  ROUTE COLLAPSE WARNING: {resource_stats['collapse_warning']}")
+            append_dynamic_resource_history(
+                iter_num, resource_stats, raw_model.last_loss_stats or {}
+            )
         width_stats = raw_model.last_dynamic_width_stats
         if width_stats is not None:
             dist = ", ".join(
@@ -650,6 +838,30 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
+            if depth_stats is not None:
+                wandb_metrics.update({
+                    "dynamic_depth/mean_depth": depth_stats["mean_depth"],
+                    "dynamic_depth/theoretical_layer_savings": depth_stats["theoretical_layer_savings"],
+                    "dynamic_depth/router_entropy": depth_stats["router_entropy"],
+                    "dynamic_depth/temperature": raw_model.config.dynamic_depth_temperature,
+                    "dynamic_depth/compute_weight": raw_model.config.dynamic_depth_compute_weight_current,
+                })
+                for depth in depth_stats["depth_choices"]:
+                    wandb_metrics[f"dynamic_depth/d{depth}_fraction"] = depth_stats["depth_fractions"][str(depth)]
+            if resource_stats is not None:
+                wandb_metrics.update({
+                    "dynamic_resource/average_compute": resource_stats["average_compute"],
+                    "dynamic_resource/expected_compute": resource_stats["expected_compute"],
+                    "dynamic_resource/average_active_layers": resource_stats["average_active_layers"],
+                    "dynamic_resource/average_width": resource_stats["average_width"],
+                    "dynamic_resource/unique_paths": resource_stats["observed_paths"],
+                    "dynamic_resource/top1_coverage": resource_stats["top1_coverage"],
+                    "dynamic_resource/top4_coverage": resource_stats["top4_coverage"],
+                    "dynamic_resource/top8_coverage": resource_stats["top8_coverage"],
+                    "dynamic_resource/top16_coverage": resource_stats["top16_coverage"],
+                    "dynamic_resource/router_entropy": resource_stats["router_entropy"],
+                    "dynamic_resource/router_confidence": resource_stats["router_confidence"],
+                })
             if width_stats is not None:
                 wandb_metrics.update({
                     "dynamic_width/mean_effective_width": width_stats["mean_effective_width"],
@@ -724,6 +936,10 @@ while True:
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
+                if enable_dynamic_depth:
+                    model_args['dynamic_depth_temperature'] = raw_model.config.dynamic_depth_temperature
+                if dynamic_resource:
+                    model_args['dynamic_resource_temperature'] = raw_model.config.dynamic_resource_temperature
                 if dynamic_width:
                     model_args['dynamic_width_temperature'] = raw_model.config.dynamic_width_temperature
                 if free_channel_mlp:
@@ -789,6 +1005,49 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        depth_stats = raw_model.last_dynamic_depth_stats
+        if depth_stats is not None:
+            loss_stats = raw_model.last_loss_stats or {}
+            depth_dist = ", ".join(
+                f"D{depth}={depth_stats['depth_fractions'][str(depth)]:.3f}"
+                for depth in depth_stats["depth_choices"]
+            )
+            ce_text = ", ".join(
+                f"CE_D{depth}={loss_stats.get(f'dynamic_depth_ce_d{depth}', 0.0):.4f}"
+                for depth in depth_stats["depth_choices"]
+            )
+            print(
+                f"  dynamic_depth: mean {depth_stats['mean_depth']:.3f}, "
+                f"saved {100 * depth_stats['theoretical_layer_savings']:.2f}%, "
+                f"entropy {depth_stats['router_entropy']:.4f}, {depth_dist}"
+            )
+            print(
+                f"  depth_losses: {ce_text}, "
+                f"kd={loss_stats.get('dynamic_depth_distill', 0.0):.4f}, "
+                f"route={loss_stats.get('dynamic_depth_router_quality', 0.0):.4f}, "
+                f"cost={loss_stats.get('dynamic_depth_expected_cost', 0.0):.4f}, "
+                f"lambda={loss_stats.get('dynamic_depth_compute_weight', 0.0):.4f}"
+            )
+        resource_stats = raw_model.last_dynamic_resource_stats
+        if resource_stats is not None:
+            loss_stats = raw_model.last_loss_stats or {}
+            print(
+                f"  dynamic_resource: paths {resource_stats['observed_paths']}/"
+                f"{resource_stats['theoretical_paths']}, compute {resource_stats['average_compute']:.3f}, "
+                f"active_layers {resource_stats['average_active_layers']:.3f}, "
+                f"top1/4/8 {resource_stats['top1_coverage']:.3f}/"
+                f"{resource_stats['top4_coverage']:.3f}/{resource_stats['top8_coverage']:.3f}, "
+                f"entropy {resource_stats['router_entropy']:.4f}"
+            )
+            print(
+                f"  resource_losses: dynamic_ce={loss_stats.get('dynamic_resource_ce', 0.0):.4f}, "
+                f"full_ce={loss_stats.get('dynamic_resource_full_ce', 0.0):.4f}, "
+                f"kd={loss_stats.get('dynamic_resource_distill', 0.0):.4f}, "
+                f"expected_compute={loss_stats.get('dynamic_resource_expected_compute', 0.0):.4f}, "
+                f"lambda={loss_stats.get('dynamic_resource_compute_weight', 0.0):.4f}"
+            )
+            if resource_stats["collapse_warning"]:
+                print(f"  ROUTE COLLAPSE WARNING: {resource_stats['collapse_warning']}")
         mlp_stats = raw_model.last_dynamic_mlp_stats
         if mlp_stats is not None:
             print(

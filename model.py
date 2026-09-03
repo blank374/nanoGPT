@@ -1020,11 +1020,87 @@ class HardwareAtomMLP(nn.Module):
             return self._forward_grouped(x, selected)
         return self._forward_dense_mask(x, mode_onehot)
 
+
+class ResourceRouter(nn.Module):
+    """Choose one structured MLP resource for every request and layer."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.norm = LayerNorm(config.n_embd, bias=config.bias)
+        self.proj = nn.Linear(config.n_embd, config.n_layer * len(config.dynamic_resource_widths),
+                              bias=config.bias)
+        self.n_layer = config.n_layer
+        self.n_choices = len(config.dynamic_resource_widths)
+
+    def forward(self, x):
+        summary = self.norm(x.mean(dim=1))
+        return self.proj(summary).view(x.size(0), self.n_layer, self.n_choices)
+
+
+class ResourceRoutedMLP(nn.Module):
+    """Nested-prefix MLP whose request-level route is supplied by GPT."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.max_hidden = 4 * config.n_embd
+        self.width_choices = [int(width) for width in config.dynamic_resource_widths]
+        assert self.width_choices[0] == 0
+        assert self.width_choices[-1] == self.max_hidden
+        self.c_fc = nn.Linear(config.n_embd, self.max_hidden, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(self.max_hidden, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        self.route_weights = None
+        self.selected_mode = None
+        self.physical = False
+
+    def _prefix_linear(self, x, width):
+        if width == 0:
+            return torch.zeros_like(x)
+        fc_bias = self.c_fc.bias[:width] if self.c_fc.bias is not None else None
+        hidden = F.linear(x, self.c_fc.weight[:width], fc_bias)
+        hidden = self.gelu(hidden)
+        return F.linear(hidden, self.c_proj.weight[:, :width], None)
+
+    def _forward_physical(self, x):
+        B = x.size(0)
+        out = torch.zeros_like(x)
+        for mode_idx, width in enumerate(self.width_choices):
+            if width == 0:
+                continue
+            rows = (self.selected_mode == mode_idx).nonzero(as_tuple=False).flatten()
+            if rows.numel() == 0:
+                continue
+            value = self._prefix_linear(x.index_select(0, rows), width)
+            out.index_copy_(0, rows, value.to(out.dtype))
+        # Projection bias belongs to every executed MLP, but never to Skip.
+        if self.c_proj.bias is not None:
+            active = (self.selected_mode != 0).to(out.dtype).view(B, 1, 1)
+            out = out + active * self.c_proj.bias.view(1, 1, -1)
+        return self.dropout(out)
+
+    def forward(self, x):
+        if self.route_weights is None or self.selected_mode is None:
+            raise RuntimeError("resource route must be assigned before Block.forward")
+        if self.physical:
+            return self._forward_physical(x)
+        out = torch.zeros_like(x)
+        for mode_idx, width in enumerate(self.width_choices):
+            if width == 0:
+                continue
+            value = self._prefix_linear(x, width)
+            weight = self.route_weights[:, mode_idx].to(value.dtype).view(-1, 1, 1)
+            out = out + weight * value
+        if self.c_proj.bias is not None:
+            active = self.route_weights[:, 1:].sum(dim=-1).to(out.dtype).view(-1, 1, 1)
+            out = out + active * self.c_proj.bias.view(1, 1, -1)
+        return self.dropout(out)
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp, config.hardware_atom_mlp]) <= 1, \
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp, config.hardware_atom_mlp, config.dynamic_resource]) <= 1, \
             "dynamic MLP variants are mutually exclusive"
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
@@ -1036,6 +1112,7 @@ class Block(nn.Module):
         self.block_precision_mlp = config.block_precision_mlp
         self.resource_mode_mlp = config.resource_mode_mlp
         self.hardware_atom_mlp = config.hardware_atom_mlp
+        self.dynamic_resource = config.dynamic_resource
         if config.dynamic_mlp:
             self.mlp = FastSlowMLP(config)
         elif config.dynamic_width:
@@ -1050,6 +1127,8 @@ class Block(nn.Module):
             self.mlp = ResourceModeMLP(config)
         elif config.hardware_atom_mlp:
             self.mlp = HardwareAtomMLP(config)
+        elif config.dynamic_resource:
+            self.mlp = ResourceRoutedMLP(config)
         else:
             self.mlp = MLP(config)
 
@@ -1093,6 +1172,22 @@ class HardwareAtomAddressHead(nn.Module):
         summary = F.normalize(x.mean(dim=1).float(), dim=-1)
         return self.proj(summary).view(-1, self.num_layers, self.num_modes)
 
+
+class SequenceDepthRouter(nn.Module):
+    """Choose one GPU-friendly prefix depth once for an entire request."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.temperature = float(config.dynamic_depth_temperature)
+        self.norm = LayerNorm(config.n_embd, bias=config.bias)
+        self.proj = nn.Linear(config.n_embd, len(config.dynamic_depth_choices))
+
+    def forward(self, x):
+        # Pool before the first Transformer block so inference can skip suffix
+        # blocks rather than discovering the route after paying for them.
+        summary = self.norm(x.mean(dim=1))
+        return self.proj(summary) / max(self.temperature, 1e-4)
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -1111,6 +1206,40 @@ class GPTConfig:
     use_distillation: bool = False
     distillation_temperature: float = 2.0
     distillation_beta: float = 0.5
+    enable_dynamic_depth: bool = False
+    enable_dynamic_width: bool = False # alias; keeps depth/width switches independent
+    dynamic_depth_choices: list = None # 1-indexed prefix depths, e.g. [2, 3, 4]
+    dynamic_depth_temperature: float = 1.0
+    dynamic_depth_temperature_final: float = 0.5
+    dynamic_depth_temperature_anneal_iters: int = 1000
+    dynamic_depth_early_ce_weight: float = 0.3
+    dynamic_depth_distill_weight: float = 0.3
+    dynamic_depth_distill_temperature: float = 2.0
+    dynamic_depth_router_quality_weight: float = 1.0
+    dynamic_depth_compute_weight: float = 0.05
+    dynamic_depth_compute_weight_current: float = 0.0
+    dynamic_depth_compute_warmup_iters: int = 200
+    dynamic_depth_compute_anneal_iters: int = 800
+    dynamic_depth_entropy_weight: float = 0.01
+    dynamic_depth_full_exploration: float = 0.05
+    dynamic_depth_oracle_margin: float = 0.02
+    dynamic_depth_inference_cost_bias: float = 0.0
+    dynamic_resource: bool = False
+    dynamic_resource_widths: list = None
+    dynamic_resource_skip_mode: str = "mlp" # "mlp" or "block"
+    dynamic_resource_routing: str = "gumbel" # "soft", "ste", or "gumbel"
+    dynamic_resource_temperature: float = 1.5
+    dynamic_resource_temperature_final: float = 0.5
+    dynamic_resource_temperature_anneal_iters: int = 1000
+    dynamic_resource_compute_penalty_max: float = 0.05
+    dynamic_resource_compute_penalty_current: float = 0.0
+    dynamic_resource_compute_penalty_warmup_steps: int = 200
+    dynamic_resource_compute_penalty_anneal_steps: int = 800
+    dynamic_resource_distill_weight: float = 0.5
+    dynamic_resource_distill_temperature: float = 2.0
+    dynamic_resource_full_ce_weight: float = 0.5
+    dynamic_resource_collapse_threshold: float = 0.95
+    dynamic_resource_eval_impl: str = "physical" # "research" or "physical"
     dynamic_mlp: bool = False
     dynamic_mlp_fast_ratio: float = 1.0
     dynamic_mlp_slow_ratio: float = 3.0
@@ -1194,8 +1323,31 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp, config.hardware_atom_mlp]) <= 1, \
+        config.dynamic_width = bool(config.dynamic_width or config.enable_dynamic_width)
+        if config.dynamic_depth_choices is None:
+            config.dynamic_depth_choices = [2, 3, 4]
+        config.dynamic_depth_choices = sorted(set(int(depth) for depth in config.dynamic_depth_choices))
+        if config.dynamic_resource_widths is None:
+            config.dynamic_resource_widths = [0, config.n_embd // 2, config.n_embd,
+                                              2 * config.n_embd, 4 * config.n_embd]
+        config.dynamic_resource_widths = [int(width) for width in config.dynamic_resource_widths]
+        assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp, config.hardware_atom_mlp, config.dynamic_resource]) <= 1, \
             "dynamic MLP variants are mutually exclusive"
+        if config.dynamic_resource:
+            assert not config.enable_dynamic_depth and not config.dynamic_exit, \
+                "dynamic_resource cannot be combined with depth/exit routing"
+            assert config.dynamic_resource_widths == sorted(set(config.dynamic_resource_widths))
+            assert config.dynamic_resource_widths[0] == 0
+            assert config.dynamic_resource_widths[-1] == 4 * config.n_embd
+            assert config.dynamic_resource_skip_mode in ("mlp", "block")
+            assert config.dynamic_resource_routing in ("soft", "ste", "gumbel")
+            assert config.dynamic_resource_eval_impl in ("research", "physical")
+        if config.enable_dynamic_depth:
+            assert not config.dynamic_exit, "enable_dynamic_depth and legacy dynamic_exit cannot be enabled together"
+            assert config.dynamic_depth_choices[-1] == config.n_layer, \
+                "dynamic_depth_choices must include n_layer as the full-depth fallback"
+            assert all(1 <= depth <= config.n_layer for depth in config.dynamic_depth_choices), \
+                "dynamic_depth_choices must be valid 1-indexed prefix depths"
         if config.dynamic_width_ratios is None:
             config.dynamic_width_ratios = [0.5, 1.0, 2.0, 4.0]
         if config.block_precision_bit_choices is None:
@@ -1242,6 +1394,8 @@ class GPT(nn.Module):
         if config.dynamic_exit:
             for layer_idx in self.exit_layers:
                 self.exit_heads[str(layer_idx)] = EarlyExitHead(config)
+        self.depth_router = SequenceDepthRouter(config) if config.enable_dynamic_depth else None
+        self.resource_router = ResourceRouter(config) if config.dynamic_resource else None
         self.hardware_atom_address = (
             HardwareAtomAddressHead(config)
             if config.hardware_atom_mlp and config.hardware_atom_direct_address else None
@@ -1257,6 +1411,13 @@ class GPT(nn.Module):
         self.last_hardware_atom_address_logits = None
         self.last_hardware_atom_address_stats = None
         self.last_loss_stats = None
+        self.last_dynamic_depth_logits = None
+        self.last_dynamic_depth_router_logits = None
+        self.last_dynamic_depth_stats = None
+        self.last_dynamic_resource_logits = None
+        self.last_dynamic_resource_probs = None
+        self.last_dynamic_resource_modes = None
+        self.last_dynamic_resource_stats = None
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -1276,6 +1437,20 @@ class GPT(nn.Module):
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
         if config.dynamic_exit:
             print(f"dynamic exit enabled at layers: {self.exit_layers}")
+        if config.enable_dynamic_depth:
+            print(
+                "dynamic depth enabled: "
+                f"depths={config.dynamic_depth_choices}, shared ln_f/lm_head, "
+                f"compute_weight={config.dynamic_depth_compute_weight}"
+            )
+        if config.dynamic_resource:
+            print(
+                "dynamic resource enabled: "
+                f"widths={config.dynamic_resource_widths}, "
+                f"paths={len(config.dynamic_resource_widths) ** config.n_layer}, "
+                f"skip={config.dynamic_resource_skip_mode}, "
+                f"routing={config.dynamic_resource_routing}"
+            )
         if config.dynamic_mlp:
             print(
                 "dynamic MLP enabled: "
@@ -1478,6 +1653,11 @@ class GPT(nn.Module):
             tok_emb = self.transformer.wte(idx)
             pos_emb = self.transformer.wpe(pos)
             x = self.transformer.drop(tok_emb + pos_emb)
+            self.last_dynamic_depth_logits = None
+            self.last_dynamic_depth_router_logits = (
+                self.depth_router(x)
+                if self.depth_router is not None and targets is not None else None
+            )
             if compute_address:
                 self.last_hardware_atom_address_logits = (
                     self.hardware_atom_address(x) if self.hardware_atom_address is not None else None
@@ -1489,18 +1669,26 @@ class GPT(nn.Module):
                 for layer, mlp in enumerate(direct_modules):
                     mlp.external_mode_probs = address_probs[:, layer, :]
             exit_outputs = []
+            depth_logits = {}
             for layer_idx, block in enumerate(self.transformer.h, start=1):
                 x = block(x)
                 if self.config.dynamic_exit and targets is not None and layer_idx in self.exit_layers:
                     exit_logits = self.exit_heads[str(layer_idx)](x)
                     exit_outputs.append((layer_idx, exit_logits))
+                if (self.config.enable_dynamic_depth and targets is not None
+                        and layer_idx in self.config.dynamic_depth_choices):
+                    # All depths deliberately share the final normalization and
+                    # vocabulary projection; no per-exit vocabulary heads.
+                    depth_logits[layer_idx] = self.lm_head(self.transformer.ln_f(x))
             x = self.transformer.ln_f(x)
             if targets is not None:
-                logits = self.lm_head(x)
+                logits = (depth_logits[self.config.n_layer]
+                          if self.config.n_layer in depth_logits else self.lm_head(x))
             else:
                 # Basic slicing is CUDA-Graph-safe and avoids the temporary
                 # index tensor created by list-based advanced indexing.
                 logits = self.lm_head(x[:, -1:, :])
+            self.last_dynamic_depth_logits = depth_logits or None
             return logits, exit_outputs
         finally:
             for mlp, force in old_force:
@@ -2091,6 +2279,261 @@ class GPT(nn.Module):
             "layers": layer_stats,
         }
 
+    def set_dynamic_depth_temperature(self, temperature):
+        if self.depth_router is None:
+            return
+        self.config.dynamic_depth_temperature = float(temperature)
+        self.depth_router.temperature = float(temperature)
+
+    def set_dynamic_depth_compute_weight(self, weight):
+        self.config.dynamic_depth_compute_weight_current = float(weight)
+
+    def _dynamic_depth_probabilities(self):
+        if self.last_dynamic_depth_router_logits is None:
+            return None
+        return self.last_dynamic_depth_router_logits.softmax(dim=-1)
+
+    @staticmethod
+    def _per_sequence_cross_entropy(logits, targets):
+        token_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
+            ignore_index=-1, reduction="none"
+        ).view_as(targets)
+        valid = (targets != -1)
+        counts = valid.sum(dim=1).clamp_min(1)
+        return (token_loss * valid).sum(dim=1) / counts
+
+    def _dynamic_depth_loss_terms(self, targets):
+        depth_logits = self.last_dynamic_depth_logits
+        probs = self._dynamic_depth_probabilities()
+        if not depth_logits or probs is None:
+            return None
+
+        choices = self.config.dynamic_depth_choices
+        full_depth = choices[-1]
+        full_logits = depth_logits[full_depth]
+        seq_losses = torch.stack([
+            self._per_sequence_cross_entropy(depth_logits[depth], targets)
+            for depth in choices
+        ], dim=-1)
+        mean_ce = seq_losses.mean(dim=0)
+        shallow_ce = mean_ce[:-1].mean() if len(choices) > 1 else mean_ce[-1]
+
+        valid = targets != -1
+        distill_terms = []
+        temperature = self.config.dynamic_depth_distill_temperature
+        for depth in choices[:-1]:
+            per_token_kl = F.kl_div(
+                F.log_softmax(depth_logits[depth] / temperature, dim=-1),
+                F.softmax(full_logits.detach() / temperature, dim=-1),
+                reduction="none",
+            ).sum(dim=-1)
+            distill_terms.append(per_token_kl[valid].mean() * (temperature * temperature))
+        distill = (torch.stack(distill_terms).mean() if distill_terms
+                   else full_logits.new_zeros(()))
+
+        # A small full-depth floor keeps D4 examples alive while the router is
+        # learning. The quality loss uses detached path losses: it trains the
+        # router, while CE/KD train the shared backbone.
+        effective_probs = probs
+        exploration = self.config.dynamic_depth_full_exploration
+        if self.training and exploration > 0.0:
+            full = torch.zeros_like(probs)
+            full[:, -1] = 1.0
+            effective_probs = (1.0 - exploration) * probs + exploration * full
+        # Teach the router the shallowest path whose per-request CE remains
+        # within a small margin of D4. This creates content-dependent targets
+        # instead of letting one globally best depth win every request.
+        detached_losses = seq_losses.detach()
+        oracle_target = torch.full(
+            (seq_losses.size(0),), len(choices) - 1,
+            dtype=torch.long, device=seq_losses.device
+        )
+        margin = self.config.dynamic_depth_oracle_margin
+        for mode_idx in range(len(choices) - 2, -1, -1):
+            reliable = detached_losses[:, mode_idx] <= detached_losses[:, -1] + margin
+            oracle_target[reliable] = mode_idx
+        router_quality = F.cross_entropy(self.last_dynamic_depth_router_logits, oracle_target)
+        cost_values = probs.new_tensor([depth / full_depth for depth in choices])
+        expected_cost = (effective_probs * cost_values).sum(dim=-1).mean()
+        entropy = -(probs.clamp_min(1e-9) * probs.clamp_min(1e-9).log()).sum(dim=-1).mean()
+        return {
+            "mean_ce": mean_ce,
+            "shallow_ce": shallow_ce,
+            "distill": distill,
+            "router_quality": router_quality,
+            "expected_cost": expected_cost,
+            "entropy": entropy,
+            "oracle_target": oracle_target,
+        }
+
+    def _set_dynamic_depth_stats(self, selected_depths=None):
+        probs = self._dynamic_depth_probabilities()
+        if probs is None:
+            self.last_dynamic_depth_stats = None
+            return
+        choices = self.config.dynamic_depth_choices
+        if selected_depths is None:
+            selected_idx = probs.argmax(dim=-1)
+            selected_depth = probs.new_tensor(choices)[selected_idx]
+        else:
+            selected_depth = selected_depths.to(device=probs.device)
+            selected_idx = torch.empty_like(selected_depth, dtype=torch.long)
+            for mode_idx, depth in enumerate(choices):
+                selected_idx[selected_depth == depth] = mode_idx
+        confidence = probs.max(dim=-1).values
+        fractions = {}
+        per_depth_confidence = {}
+        for mode_idx, depth in enumerate(choices):
+            mask = selected_idx == mode_idx
+            fractions[str(depth)] = mask.float().mean().item()
+            per_depth_confidence[str(depth)] = (
+                confidence[mask].mean().item() if mask.any() else 0.0
+            )
+        mean_depth = selected_depth.float().mean().item()
+        self.last_dynamic_depth_stats = {
+            "depth_choices": list(choices),
+            "depth_fractions": fractions,
+            "mean_depth": mean_depth,
+            "theoretical_layer_savings": 1.0 - mean_depth / choices[-1],
+            "router_entropy": (-(probs.clamp_min(1e-9) * probs.clamp_min(1e-9).log())
+                               .sum(dim=-1).mean().item()),
+            "mean_confidence": confidence.mean().item(),
+            "per_depth_confidence": per_depth_confidence,
+        }
+
+    def predict_dynamic_depth(self, idx):
+        """Return one prefix depth per sequence without running any GPT block."""
+        assert self.depth_router is not None, "dynamic depth is not enabled"
+        b, t = idx.shape
+        assert t <= self.config.block_size
+        pos = torch.arange(t, dtype=torch.long, device=idx.device)
+        x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
+        router_logits = self.depth_router(x)
+        choices = torch.tensor(self.config.dynamic_depth_choices, device=idx.device)
+        return choices[self.dynamic_depth_route_indices(router_logits)], router_logits
+
+    def dynamic_depth_route_indices(self, router_logits):
+        """Apply a deploy-time quality/latency operating-point bias."""
+        scores = router_logits
+        bias = self.config.dynamic_depth_inference_cost_bias
+        if bias != 0.0:
+            full_depth = self.config.dynamic_depth_choices[-1]
+            costs = router_logits.new_tensor([
+                depth / full_depth for depth in self.config.dynamic_depth_choices
+            ])
+            scores = scores - bias * costs
+        return scores.argmax(dim=-1)
+
+    def build_dynamic_depth_plan(self, selected_depths):
+        """Build reusable GPU indices once; intended to be cached per request."""
+        selected_depths = selected_depths.to(dtype=torch.long)
+        sorted_depths, order = torch.sort(selected_depths, descending=True)
+        counts = {
+            depth: int((sorted_depths == depth).sum().item())
+            for depth in self.config.dynamic_depth_choices
+        }
+        return {"selected_depths": selected_depths, "order": order, "counts": counts}
+
+    def _forward_dynamic_depth_inference(self, idx, forced_depth=None, record_stats=True,
+                                         route_plan=None):
+        """Grouped prefix execution: suffix blocks are never launched."""
+        device = idx.device
+        b, t = idx.shape
+        assert t <= self.config.block_size
+        pos = torch.arange(t, dtype=torch.long, device=device)
+        x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
+        choices = self.config.dynamic_depth_choices
+        homogeneous_depth = None
+        if route_plan is not None:
+            selected_depths = route_plan["selected_depths"]
+            selected_modes = torch.empty_like(selected_depths)
+            for mode_idx, depth in enumerate(choices):
+                selected_modes[selected_depths == depth] = mode_idx
+            router_logits = F.one_hot(selected_modes, len(choices)).to(x.dtype) * 40.0 - 20.0
+            nonempty = [depth for depth in choices if route_plan["counts"][depth] > 0]
+            if len(nonempty) == 1:
+                homogeneous_depth = nonempty[0]
+        elif forced_depth is None:
+            router_logits = self.depth_router(x)
+            choice_tensor = torch.tensor(choices, device=device)
+            selected_depths = choice_tensor[self.dynamic_depth_route_indices(router_logits)]
+        elif isinstance(forced_depth, int):
+            assert forced_depth in choices
+            selected_depths = torch.full((b,), forced_depth, dtype=torch.long, device=device)
+            homogeneous_depth = forced_depth
+            selected_modes = torch.full((b,), choices.index(forced_depth), dtype=torch.long, device=device)
+            router_logits = F.one_hot(selected_modes, len(choices)).to(x.dtype) * 40.0 - 20.0
+        else:
+            selected_depths = forced_depth.to(device=device, dtype=torch.long)
+            assert selected_depths.shape == (b,)
+            selected_modes = torch.empty_like(selected_depths)
+            for mode_idx, depth in enumerate(choices):
+                selected_modes[selected_depths == depth] = mode_idx
+            router_logits = F.one_hot(selected_modes, len(choices)).to(x.dtype) * 40.0 - 20.0
+
+        # The common serving case (batch=1 or one route for the whole batch)
+        # avoids index_select/index_copy entirely. Mixed batches use true groups.
+        if homogeneous_depth is None and b == 1:
+            homogeneous_depth = int(selected_depths[0].item())
+        elif homogeneous_depth is None and bool((selected_depths == selected_depths[0]).all().item()):
+            homogeneous_depth = int(selected_depths[0].item())
+        if homogeneous_depth is not None:
+            final_hidden = x
+            for block in self.transformer.h[:homogeneous_depth]:
+                final_hidden = block(final_hidden)
+        elif route_plan is None:
+            final_hidden = torch.empty_like(x)
+            active_hidden = x
+            active_indices = torch.arange(b, device=device)
+            for layer_idx, block in enumerate(self.transformer.h, start=1):
+                active_hidden = block(active_hidden)
+                if layer_idx not in choices:
+                    continue
+                exiting = selected_depths.index_select(0, active_indices) == layer_idx
+                if exiting.any():
+                    final_hidden.index_copy_(
+                        0, active_indices[exiting], active_hidden[exiting]
+                    )
+                keep = ~exiting
+                if not keep.any():
+                    break
+                active_hidden = active_hidden[keep]
+                active_indices = active_indices[keep]
+        else:
+            # Static cached plan: sort once, run each shared prefix block once,
+            # and shrink by Python-known slice sizes without device syncs.
+            order = route_plan["order"]
+            active_hidden = x.index_select(0, order)
+            final_sorted = torch.empty_like(active_hidden)
+            active_count = b
+            for layer_idx, block in enumerate(self.transformer.h, start=1):
+                active_hidden = block(active_hidden)
+                exit_count = route_plan["counts"].get(layer_idx, 0)
+                if exit_count:
+                    keep_count = active_count - exit_count
+                    final_sorted[keep_count:active_count] = active_hidden[keep_count:active_count]
+                    active_hidden = active_hidden[:keep_count]
+                    active_count = keep_count
+                if active_count == 0:
+                    break
+            final_hidden = torch.empty_like(final_sorted)
+            final_hidden.index_copy_(0, order, final_sorted)
+        logits = self.lm_head(self.transformer.ln_f(final_hidden[:, -1:, :]))
+        if record_stats:
+            self.last_dynamic_depth_router_logits = router_logits
+            self.last_dynamic_depth_logits = None
+            self._set_dynamic_depth_stats(selected_depths=selected_depths)
+        return logits, None
+
+    @torch.no_grad()
+    def forward_dynamic_depth(self, idx, forced_depth=None, record_stats=True, route_plan=None):
+        assert self.depth_router is not None, "dynamic depth is not enabled"
+        return self._forward_dynamic_depth_inference(
+            idx, forced_depth=forced_depth, record_stats=record_stats,
+            route_plan=route_plan
+        )
+
     def _forward_dynamic_inference(self, idx, pos):
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
@@ -2168,12 +2611,199 @@ class GPT(nn.Module):
 
         return final_logits, None
 
+    def set_dynamic_resource_temperature(self, temperature):
+        if not self.config.dynamic_resource:
+            return
+        self.config.dynamic_resource_temperature = float(temperature)
+
+    def set_dynamic_resource_compute_penalty(self, weight):
+        if self.config.dynamic_resource:
+            self.config.dynamic_resource_compute_penalty_current = float(weight)
+
+    def _dynamic_resource_route(self, x, forced_path=None):
+        logits = self.resource_router(x) / max(self.config.dynamic_resource_temperature, 1e-4)
+        probs = logits.softmax(dim=-1)
+        if forced_path is not None:
+            path = torch.as_tensor(forced_path, dtype=torch.long, device=x.device)
+            if path.dim() == 1:
+                path = path.unsqueeze(0).expand(x.size(0), -1)
+            if path.shape != (x.size(0), self.config.n_layer):
+                raise ValueError(f"forced_path must have shape [{x.size(0)}, {self.config.n_layer}]")
+            widths = self.config.dynamic_resource_widths
+            try:
+                modes = torch.empty_like(path)
+                for mode_idx, width in enumerate(widths):
+                    modes[path == width] = mode_idx
+                if not bool(torch.stack([(path == width) for width in widths]).any(dim=0).all().item()):
+                    raise ValueError
+            except (RuntimeError, ValueError):
+                raise ValueError(f"forced_path entries must be in {widths}") from None
+            weights = F.one_hot(modes, len(widths)).to(probs.dtype)
+            return logits, probs, modes, weights
+
+        modes = probs.argmax(dim=-1)
+        hard = F.one_hot(modes, probs.size(-1)).to(probs.dtype)
+        routing = self.config.dynamic_resource_routing
+        if not self.training or routing == "ste":
+            weights = hard + probs - probs.detach() if self.training else hard
+        elif routing == "gumbel":
+            weights = F.gumbel_softmax(
+                logits, tau=1.0, hard=True, dim=-1
+            )
+            modes = weights.argmax(dim=-1)
+        else:
+            weights = probs
+        return logits, probs, modes, weights
+
+    def _set_dynamic_resource_stats(self, probs, modes):
+        widths = torch.tensor(self.config.dynamic_resource_widths, device=modes.device)
+        selected_widths = widths[modes]
+        costs = probs.new_tensor([0.0, 0.125, 0.25, 0.50, 1.0])
+        expected_compute = (probs * costs).sum(dim=-1).sum(dim=-1).mean()
+        hard_compute = costs[modes].sum(dim=-1).mean()
+        active = selected_widths != 0
+        path_ids = torch.zeros(modes.size(0), dtype=torch.long, device=modes.device)
+        for layer in range(modes.size(1)):
+            path_ids = path_ids * len(self.config.dynamic_resource_widths) + modes[:, layer]
+        unique_ids, counts = path_ids.unique(return_counts=True)
+        order = counts.argsort(descending=True)
+        sorted_counts = counts[order]
+        coverage = lambda k: sorted_counts[:k].sum().float().div(modes.size(0)).item()
+        common_paths = []
+        for item in order[:min(16, order.numel())]:
+            path_id = unique_ids[item]
+            row = (path_ids == path_id).nonzero(as_tuple=False)[0, 0]
+            common_paths.append({
+                "path": [int(value) for value in selected_widths[row].tolist()],
+                "count": int(counts[item].item()),
+                "fraction": counts[item].float().div(modes.size(0)).item(),
+            })
+        top1 = coverage(1)
+        dominant = common_paths[0]["path"] if common_paths else []
+        all_min = bool(dominant) and all(width == 0 for width in dominant)
+        all_max = bool(dominant) and all(width == self.config.dynamic_resource_widths[-1]
+                                             for width in dominant)
+        warning = None
+        if top1 >= self.config.dynamic_resource_collapse_threshold:
+            warning = "minimum" if all_min else ("maximum" if all_max else "single_path")
+        entropy = -(probs.clamp_min(1e-9) * probs.clamp_min(1e-9).log()).sum(dim=-1)
+        self.last_dynamic_resource_stats = {
+            "theoretical_paths": len(self.config.dynamic_resource_widths) ** self.config.n_layer,
+            "observed_paths": int(unique_ids.numel()),
+            "top1_coverage": top1,
+            "top4_coverage": coverage(4),
+            "top8_coverage": coverage(8),
+            "top16_coverage": coverage(16),
+            "average_compute": hard_compute.item(),
+            "expected_compute": expected_compute.item(),
+            "compute_saving": 1.0 - hard_compute.item() / self.config.n_layer,
+            "average_active_layers": active.float().sum(dim=-1).mean().item(),
+            "average_width": selected_widths.float().mean().item(),
+            "average_active_width": selected_widths.sum().float().div(active.sum().clamp_min(1)).item(),
+            "router_entropy": entropy.mean().item(),
+            "router_confidence": probs.max(dim=-1).values.mean().item(),
+            "most_common_paths": common_paths,
+            "collapse_warning": warning,
+        }
+
+    def _forward_dynamic_resource_logits(self, idx, forced_path=None, record_stats=True,
+                                         all_logits=False):
+        device = idx.device
+        B, T = idx.shape
+        pos = torch.arange(T, dtype=torch.long, device=device)
+        x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
+        logits, probs, modes, weights = self._dynamic_resource_route(x, forced_path)
+        physical = (not self.training and self.config.dynamic_resource_eval_impl == "physical")
+        for layer_idx, block in enumerate(self.transformer.h):
+            block.mlp.route_weights = weights[:, layer_idx]
+            block.mlp.selected_mode = modes[:, layer_idx]
+            block.mlp.physical = physical
+            if self.config.dynamic_resource_skip_mode == "mlp":
+                x = block(x)
+            elif physical:
+                active_rows = (modes[:, layer_idx] != 0).nonzero(as_tuple=False).flatten()
+                if active_rows.numel() != 0:
+                    old = x.index_select(0, active_rows)
+                    block.mlp.route_weights = weights.index_select(0, active_rows)[:, layer_idx]
+                    block.mlp.selected_mode = modes.index_select(0, active_rows)[:, layer_idx]
+                    updated = block(old)
+                    x = x.clone()
+                    x.index_copy_(0, active_rows, updated.to(x.dtype))
+            else:
+                old = x
+                updated = block(x)
+                active_weight = weights[:, layer_idx, 1:].sum(dim=-1).to(x.dtype).view(B, 1, 1)
+                x = old + active_weight * (updated - old)
+        x = self.transformer.ln_f(x)
+        output = self.lm_head(
+            x if self.training or all_logits else x[:, -1:, :]
+        )
+        if record_stats:
+            self.last_dynamic_resource_logits = logits
+            self.last_dynamic_resource_probs = probs
+            self.last_dynamic_resource_modes = modes.detach()
+            self._set_dynamic_resource_stats(probs, modes.detach())
+        return output
+
+    @torch.no_grad()
+    def forward_dynamic_resource(self, idx, forced_path=None):
+        assert self.config.dynamic_resource
+        return self._forward_dynamic_resource_logits(idx, forced_path=forced_path)
+
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
+        if self.config.dynamic_resource:
+            logits = self._forward_dynamic_resource_logits(idx, all_logits=targets is not None)
+            if targets is None:
+                self.last_loss_stats = None
+                return logits, None
+            dynamic_ce = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
+            )
+            saved_logits = self.last_dynamic_resource_logits
+            saved_probs = self.last_dynamic_resource_probs
+            saved_modes = self.last_dynamic_resource_modes
+            full_path = [self.config.dynamic_resource_widths[-1]] * self.config.n_layer
+            full_logits = self._forward_dynamic_resource_logits(
+                idx, forced_path=full_path, record_stats=False, all_logits=True
+            )
+            full_ce = F.cross_entropy(
+                full_logits.reshape(-1, full_logits.size(-1)), targets.reshape(-1), ignore_index=-1
+            )
+            temperature = self.config.dynamic_resource_distill_temperature
+            per_token_kl = F.kl_div(
+                F.log_softmax(logits / temperature, dim=-1),
+                F.softmax(full_logits.detach() / temperature, dim=-1), reduction="none"
+            ).sum(dim=-1)
+            valid = targets != -1
+            distill = per_token_kl[valid].mean() * (temperature * temperature)
+            costs = saved_probs.new_tensor([0.0, 0.125, 0.25, 0.50, 1.0])
+            expected_compute = (saved_probs * costs).sum(dim=-1).sum(dim=-1).mean()
+            loss = (dynamic_ce
+                    + self.config.dynamic_resource_full_ce_weight * full_ce
+                    + self.config.dynamic_resource_distill_weight * distill
+                    + self.config.dynamic_resource_compute_penalty_current * expected_compute)
+            self.last_dynamic_resource_logits = saved_logits
+            self.last_dynamic_resource_probs = saved_probs
+            self.last_dynamic_resource_modes = saved_modes
+            self._set_dynamic_resource_stats(saved_probs, saved_modes)
+            self.last_loss_stats = {
+                "task_loss": dynamic_ce.detach().item(),
+                "dynamic_resource_ce": dynamic_ce.detach().item(),
+                "dynamic_resource_full_ce": full_ce.detach().item(),
+                "dynamic_resource_distill": distill.detach().item(),
+                "dynamic_resource_expected_compute": expected_compute.detach().item(),
+                "dynamic_resource_compute_weight": self.config.dynamic_resource_compute_penalty_current,
+                "total_loss": loss.detach().item(),
+            }
+            return logits, loss
+
+        if self.config.enable_dynamic_depth and targets is None and not self.training:
+            return self._forward_dynamic_depth_inference(idx)
         if self.config.dynamic_exit and targets is None and not self.training:
             return self._forward_dynamic_inference(idx, pos)
 
@@ -2183,6 +2813,14 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             task_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             loss = task_loss
+            dynamic_depth_terms = self._dynamic_depth_loss_terms(targets)
+            if dynamic_depth_terms is not None:
+                loss = loss + self.config.dynamic_depth_early_ce_weight * dynamic_depth_terms["shallow_ce"]
+                loss = loss + self.config.dynamic_depth_distill_weight * dynamic_depth_terms["distill"]
+                loss = loss + self.config.dynamic_depth_router_quality_weight * dynamic_depth_terms["router_quality"]
+                loss = loss + self.config.dynamic_depth_compute_weight_current * dynamic_depth_terms["expected_cost"]
+                loss = loss - self.config.dynamic_depth_entropy_weight * dynamic_depth_terms["entropy"]
+            self._set_dynamic_depth_stats()
             aux_losses = []
             if self.config.dynamic_exit and exit_outputs:
                 for _, exit_logits in exit_outputs:
@@ -2269,6 +2907,20 @@ class GPT(nn.Module):
                 "task_loss": task_loss.detach().item(),
                 "total_loss": loss.detach().item(),
             }
+            if dynamic_depth_terms is not None:
+                for depth, value in zip(self.config.dynamic_depth_choices, dynamic_depth_terms["mean_ce"]):
+                    self.last_loss_stats[f"dynamic_depth_ce_d{depth}"] = value.detach().item()
+                self.last_loss_stats.update({
+                    "dynamic_depth_distill": dynamic_depth_terms["distill"].detach().item(),
+                    "dynamic_depth_router_quality": dynamic_depth_terms["router_quality"].detach().item(),
+                    "dynamic_depth_expected_cost": dynamic_depth_terms["expected_cost"].detach().item(),
+                    "dynamic_depth_entropy": dynamic_depth_terms["entropy"].detach().item(),
+                    "dynamic_depth_compute_weight": self.config.dynamic_depth_compute_weight_current,
+                })
+                for mode_idx, depth in enumerate(self.config.dynamic_depth_choices):
+                    self.last_loss_stats[f"dynamic_depth_oracle_d{depth}"] = (
+                        (dynamic_depth_terms["oracle_target"] == mode_idx).float().mean().item()
+                    )
             if dynamic_mlp_cost is not None:
                 self.last_loss_stats["dynamic_mlp_cost"] = dynamic_mlp_cost.detach().item()
             if dynamic_width_cost is not None:
@@ -2299,6 +2951,7 @@ class GPT(nn.Module):
             self.last_exit_stats = None
             self.last_exit_details = None
             self.last_loss_stats = None
+            self._set_dynamic_depth_stats()
             gates, hard_masks = self._dynamic_mlp_gates()
             self._set_dynamic_mlp_stats(gates, hard_masks)
             self._set_dynamic_width_stats(self._dynamic_width_modules())
@@ -2431,20 +3084,40 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, return_exit_stats=False):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None,
+                 return_exit_stats=False, fixed_depth=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         exit_stats = []
+        request_depth = fixed_depth
+        request_depth_plan = None
+        if self.config.enable_dynamic_depth and request_depth is None:
+            # Choose once from the original prompt. All subsequent decode steps
+            # keep this route, even though nanoGPT grows/crops the context.
+            request_depth, _ = self.predict_dynamic_depth(idx)
+            if idx.size(0) == 1:
+                request_depth = int(request_depth.item())
+            else:
+                request_depth_plan = self.build_dynamic_depth_plan(request_depth)
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            if self.config.enable_dynamic_depth:
+                logits, _ = self.forward_dynamic_depth(
+                    idx_cond, forced_depth=(None if request_depth_plan is not None else request_depth),
+                    record_stats=return_exit_stats, route_plan=request_depth_plan
+                )
+            else:
+                logits, _ = self(idx_cond)
             if return_exit_stats and self.config.dynamic_exit and self.last_exit_stats is not None:
                 exit_stats.append(self.last_exit_stats)
+            elif (return_exit_stats and self.config.enable_dynamic_depth
+                  and self.last_dynamic_depth_stats is not None):
+                exit_stats.append(self.last_dynamic_depth_stats)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
