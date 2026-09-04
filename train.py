@@ -89,6 +89,7 @@ dynamic_resource = False
 dynamic_resource_widths = [0, 64, 128, 256, 512]
 dynamic_resource_skip_mode = "mlp"
 dynamic_resource_routing = "gumbel"
+dynamic_resource_exploration = 0.05
 dynamic_resource_temperature = 1.5
 dynamic_resource_temperature_final = 0.5
 dynamic_resource_temperature_anneal_iters = 1000
@@ -184,6 +185,7 @@ hardware_atom_address_loss_weight = 0.1
 hardware_atom_address_agreement_weight = 0.05
 hardware_atom_address_task_weight = 0.0
 resume_optimizer = True # set False when adding new trainable heads to an old checkpoint
+seed = 1337
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -233,7 +235,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -305,6 +307,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   dynamic_resource_widths=dynamic_resource_widths,
                   dynamic_resource_skip_mode=dynamic_resource_skip_mode,
                   dynamic_resource_routing=dynamic_resource_routing,
+                  dynamic_resource_exploration=dynamic_resource_exploration,
                   dynamic_resource_temperature=dynamic_resource_temperature,
                   dynamic_resource_temperature_final=dynamic_resource_temperature_final,
                   dynamic_resource_temperature_anneal_iters=dynamic_resource_temperature_anneal_iters,
@@ -427,6 +430,7 @@ elif init_from == 'resume':
               'dynamic_depth_inference_cost_bias', 'dynamic_resource',
               'dynamic_resource_widths', 'dynamic_resource_skip_mode',
               'dynamic_resource_routing', 'dynamic_resource_temperature',
+              'dynamic_resource_exploration',
               'dynamic_resource_temperature_final',
               'dynamic_resource_temperature_anneal_iters',
               'dynamic_resource_compute_penalty_max',

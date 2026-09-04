@@ -1228,6 +1228,7 @@ class GPTConfig:
     dynamic_resource_widths: list = None
     dynamic_resource_skip_mode: str = "mlp" # "mlp" or "block"
     dynamic_resource_routing: str = "gumbel" # "soft", "ste", or "gumbel"
+    dynamic_resource_exploration: float = 0.05
     dynamic_resource_temperature: float = 1.5
     dynamic_resource_temperature_final: float = 0.5
     dynamic_resource_temperature_anneal_iters: int = 1000
@@ -1341,6 +1342,7 @@ class GPT(nn.Module):
             assert config.dynamic_resource_widths[-1] == 4 * config.n_embd
             assert config.dynamic_resource_skip_mode in ("mlp", "block")
             assert config.dynamic_resource_routing in ("soft", "ste", "gumbel")
+            assert 0.0 <= config.dynamic_resource_exploration < 1.0
             assert config.dynamic_resource_eval_impl in ("research", "physical")
         if config.enable_dynamic_depth:
             assert not config.dynamic_exit, "enable_dynamic_depth and legacy dynamic_exit cannot be enabled together"
@@ -2623,6 +2625,9 @@ class GPT(nn.Module):
     def _dynamic_resource_route(self, x, forced_path=None):
         logits = self.resource_router(x) / max(self.config.dynamic_resource_temperature, 1e-4)
         probs = logits.softmax(dim=-1)
+        if self.training and self.config.dynamic_resource_exploration > 0.0:
+            exploration = self.config.dynamic_resource_exploration
+            probs = (1.0 - exploration) * probs + exploration / probs.size(-1)
         if forced_path is not None:
             path = torch.as_tensor(forced_path, dtype=torch.long, device=x.device)
             if path.dim() == 1:
@@ -2648,7 +2653,7 @@ class GPT(nn.Module):
             weights = hard + probs - probs.detach() if self.training else hard
         elif routing == "gumbel":
             weights = F.gumbel_softmax(
-                logits, tau=1.0, hard=True, dim=-1
+                probs.clamp_min(1e-9).log(), tau=1.0, hard=True, dim=-1
             )
             modes = weights.argmax(dim=-1)
         else:

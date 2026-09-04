@@ -23,6 +23,7 @@ dynamic_resource = True
 dynamic_resource_widths = [0, 64, 128, 256, 512]
 dynamic_resource_skip_mode = 'mlp'
 dynamic_resource_routing = 'gumbel'
+dynamic_resource_exploration = 0.05
 dynamic_resource_temperature = 1.5
 dynamic_resource_temperature_final = 0.5
 dynamic_resource_temperature_anneal_iters = 1000
@@ -57,4 +58,3 @@ warmup_iters = 100
 device = 'cuda'
 dtype = 'float16'
 compile = False
-

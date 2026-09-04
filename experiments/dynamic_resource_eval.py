@@ -103,6 +103,7 @@ def evaluate(model, data, batches, batch_size, block_size, device):
         "expected_compute": expected_compute / requests,
         "compute_saving": 1.0 - average_compute / model.config.n_layer,
         "average_active_layers": active_layers / requests,
+        "skip_fraction": 1.0 - active_layers / (requests * model.config.n_layer),
         "average_width": width_sum / (requests * model.config.n_layer),
         "theoretical_paths": len(widths) ** model.config.n_layer,
         "observed_paths": len(path_counts),
@@ -196,6 +197,7 @@ def print_report(metrics, latency):
     print(f"Average normalized compute: {metrics['average_compute']:.4f}")
     print(f"Compute saving: {metrics['compute_saving']:.2%}")
     print(f"Average active layers: {metrics['average_active_layers']:.3f}")
+    print(f"Skip fraction: {metrics['skip_fraction']:.2%}")
     print(f"Average MLP width: {metrics['average_width']:.2f}")
     print(f"Observed paths: {metrics['observed_paths']}/{metrics['theoretical_paths']}")
     print(f"Top1/4/8/16 coverage: {metrics['top1_coverage']:.2%} / "
@@ -248,4 +250,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
