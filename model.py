@@ -41,6 +41,34 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.free_q = config.free_q
+        self.free_q_selector = config.free_q_selector
+        self.free_q_threshold = config.free_q_threshold
+        self.free_q_temperature = config.free_q_temperature
+        self.free_q_source_projection = config.free_q_source_projection
+        self.free_q_num_sources = 4
+        if self.free_q:
+            # One independent set of source logits per attention head. Routing is
+            # token-level so training tokens cannot see the future through pooling.
+            self.q_source_router = nn.Linear(
+                config.n_embd, config.n_head * self.free_q_num_sources,
+                bias=config.bias,
+            )
+            if self.free_q_source_projection == "linear":
+                self.q_source_projections = nn.ModuleList([
+                    nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+                    for _ in range(self.free_q_num_sources)
+                ])
+            else:
+                self.q_source_projections = None
+        else:
+            self.q_source_router = None
+            self.q_source_projections = None
+        self.free_q_override = None
+        self.last_q_source_probs = None
+        self.last_q_source_mask = None
+        self.last_q_source_weights = None
+        self.last_q_source_available = None
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -49,13 +77,104 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    @staticmethod
+    def _sparsemax(logits, dim=-1):
+        """Sparsemax with exact zero weights (Martins & Astudillo, 2016)."""
+        shifted = logits - logits.max(dim=dim, keepdim=True).values
+        sorted_logits, _ = torch.sort(shifted, dim=dim, descending=True)
+        size = logits.size(dim)
+        ranks_shape = [1] * logits.dim()
+        ranks_shape[dim] = size
+        ranks = torch.arange(
+            1, size + 1, device=logits.device, dtype=logits.dtype
+        ).view(ranks_shape)
+        cumulative = sorted_logits.cumsum(dim)
+        support = 1 + ranks * sorted_logits > cumulative
+        support_size = support.sum(dim=dim, keepdim=True).clamp_min(1)
+        tau = (cumulative.gather(dim, support_size - 1) - 1) / support_size.to(logits.dtype)
+        return torch.clamp(shifted - tau, min=0)
+
+    def _free_q_weights(self, router_input, available):
+        B, T, _ = router_input.shape
+        logits = self.q_source_router(router_input).view(
+            B, T, self.n_head, self.free_q_num_sources
+        ) / max(float(self.free_q_temperature), 1e-4)
+        available = available.view(1, 1, 1, -1).expand_as(logits)
+
+        if self.free_q_selector == "binary":
+            probs = torch.sigmoid(logits) * available.to(logits.dtype)
+            if self.training:
+                hard = torch.bernoulli(probs).to(logits.dtype)
+            else:
+                hard = (probs >= self.free_q_threshold).to(logits.dtype)
+            empty = hard.sum(dim=-1, keepdim=True) == 0
+            fallback_idx = probs.masked_fill(~available, -1).argmax(dim=-1)
+            fallback = F.one_hot(
+                fallback_idx, num_classes=self.free_q_num_sources
+            ).to(logits.dtype)
+            hard = torch.where(empty, fallback, hard)
+            ste = hard + probs - probs.detach()
+            weights = ste / hard.sum(dim=-1, keepdim=True).clamp_min(1)
+            mask = hard.bool()
+        elif self.free_q_selector == "sparsemax":
+            masked_logits = logits.masked_fill(~available, -1e4)
+            probs = self._sparsemax(masked_logits, dim=-1)
+            probs = probs * available.to(probs.dtype)
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            weights = probs
+            mask = probs > 1e-8
+        else:
+            raise ValueError(f"unknown free_q_selector: {self.free_q_selector}")
+
+        if self.free_q_override is not None:
+            override = self.free_q_override.to(device=logits.device)
+            if override.dim() == 2:
+                override = override.view(1, 1, self.n_head, self.free_q_num_sources)
+            elif override.dim() != 4:
+                raise ValueError("free_q override must have shape [H,S] or [B,T,H,S]")
+            override = override.expand(B, T, self.n_head, self.free_q_num_sources)
+            override = override.bool() & available
+            if not override.any(dim=-1).all():
+                raise ValueError("free_q override contains an empty or unavailable mask")
+            mask = override
+            weights = mask.to(logits.dtype)
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        self.last_q_source_probs = probs.detach()
+        self.last_q_source_mask = mask.detach()
+        self.last_q_source_weights = weights.detach()
+        self.last_q_source_available = available[0, 0, 0].detach()
+        return weights
+
+    def forward(self, x, q_sources=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        packed_q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        if self.free_q:
+            if q_sources is None or len(q_sources) != self.free_q_num_sources:
+                raise ValueError("Free-Q requires [current, previous, earlier, anchor] sources")
+            available = torch.tensor(
+                [source is not None for source in q_sources],
+                dtype=torch.bool, device=x.device,
+            )
+            sources = [source if source is not None else torch.zeros_like(x)
+                       for source in q_sources]
+            if self.q_source_projections is not None:
+                sources = [projection(source) for projection, source in
+                           zip(self.q_source_projections, sources)]
+            source_tensor = torch.stack(sources, dim=2)  # [B,T,S,C]
+            weights = self._free_q_weights(x, available) # [B,T,H,S]
+            mixed = torch.einsum("bths,btsc->bthc", weights, source_tensor)
+            head_dim = C // self.n_head
+            wq = self.c_attn.weight[:self.n_embd].view(self.n_head, head_dim, C)
+            q = torch.einsum("bthc,hdc->bthd", mixed, wq)
+            if self.c_attn.bias is not None:
+                q = q + self.c_attn.bias[:self.n_embd].view(1, 1, self.n_head, head_dim)
+            q = q.transpose(1, 2)
+        else:
+            q = packed_q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
@@ -1132,8 +1251,20 @@ class Block(nn.Module):
         else:
             self.mlp = MLP(config)
 
-    def forward(self, x):
-        attn_delta = self.attn(self.ln_1(x))
+    def forward(self, x, q_history=None):
+        attn_input = self.ln_1(x)
+        q_sources = None
+        if self.attn.free_q:
+            if q_history is None or len(q_history) != 3:
+                raise ValueError("Free-Q block requires [previous, earlier, anchor]")
+            # Normalize historical residuals with the current layer norm so the
+            # selector cannot win merely by detecting a source-scale mismatch.
+            normalized_history = [
+                self.ln_1(source) if source is not None else None
+                for source in q_history
+            ]
+            q_sources = [attn_input, *normalized_history]
+        attn_delta = self.attn(attn_input, q_sources=q_sources)
         x = x + attn_delta
         if self.dynamic_mlp:
             x = x + self.mlp(self.ln_2(x), residual_delta=attn_delta)
@@ -1188,6 +1319,638 @@ class SequenceDepthRouter(nn.Module):
         summary = self.norm(x.mean(dim=1))
         return self.proj(summary) / max(self.temperature, 1e-4)
 
+
+class CellGraphRouter(nn.Module):
+    """One causal, token-level router for every node and edge in the DAG."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_steps = config.n_layer
+        self.cells_per_step = config.cell_graph_cells_per_step
+        self.num_cells = self.num_steps * self.cells_per_step
+        self.norm = LayerNorm(config.n_embd, bias=config.bias)
+        self.node_proj = nn.Linear(config.n_embd, self.num_cells, bias=True)
+        self.edge_proj = nn.Linear(
+            config.n_embd, self.num_cells * (1 + self.num_cells), bias=True
+        )
+
+    def forward(self, x):
+        routed = self.norm(x)
+        node_logits = self.node_proj(routed)
+        edge_logits = self.edge_proj(routed).view(
+            *x.shape[:2], self.num_cells, 1 + self.num_cells
+        )
+        return node_logits, edge_logits
+
+
+class CellGraphComputeCell(nn.Module):
+    """A fixed-size  d_model -> atom -> d_model  computation atom."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.norm = LayerNorm(config.n_embd, bias=config.bias)
+        self.down = nn.Linear(config.n_embd, config.cell_graph_atom_size, bias=config.bias)
+        self.up = nn.Linear(config.cell_graph_atom_size, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, fused, current):
+        delta = self.up(F.gelu(self.down(self.norm(fused))))
+        return fused + self.dropout(delta)
+
+
+class CellGraphAttentionCell(nn.Module):
+    """Attention atom with routed history for Q and the current state for K/V."""
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout_p = config.dropout
+        self.q_norm = LayerNorm(config.n_embd, bias=config.bias)
+        self.kv_norm = LayerNorm(config.n_embd, bias=config.bias)
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.kv_proj = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        if not hasattr(F, "scaled_dot_product_attention"):
+            self.register_buffer(
+                "causal_mask",
+                torch.tril(torch.ones(config.block_size, config.block_size, dtype=torch.bool))
+                    .view(1, 1, config.block_size, config.block_size),
+            )
+
+    def forward(self, fused, current):
+        B, T, C = current.shape
+        head_dim = C // self.n_head
+        q = self.q_proj(self.q_norm(fused)).view(B, T, self.n_head, head_dim).transpose(1, 2)
+        k, v = self.kv_proj(self.kv_norm(current)).split(C, dim=-1)
+        k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        if hasattr(F, "scaled_dot_product_attention"):
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            scores = (q @ k.transpose(-2, -1)) / math.sqrt(head_dim)
+            scores = scores.masked_fill(~self.causal_mask[:, :, :T, :T], float("-inf"))
+            weights = F.softmax(scores, dim=-1)
+            weights = F.dropout(weights, p=self.dropout_p, training=self.training)
+            y = weights @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return fused + self.resid_dropout(self.out_proj(y))
+
+
+class DynamicCellGraph(nn.Module):
+    """Input-conditioned DAG whose hard nodes/edges jointly define compute."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.num_steps = config.n_layer
+        self.cells_per_step = config.cell_graph_cells_per_step
+        self.num_cells = self.num_steps * self.cells_per_step
+        self.router = CellGraphRouter(config)
+        self.cells = nn.ModuleList()
+        for _step in range(self.num_steps):
+            for cell_in_step in range(self.cells_per_step):
+                is_attention = (
+                    not config.cell_graph_fixed_attention
+                    and cell_in_step < config.cell_graph_attention_cells
+                )
+                cls = CellGraphAttentionCell if is_attention else CellGraphComputeCell
+                self.cells.append(cls(config))
+        if config.cell_graph_fixed_attention:
+            self.fixed_attention_norms = nn.ModuleList([
+                LayerNorm(config.n_embd, bias=config.bias) for _ in range(self.num_steps)
+            ])
+            self.fixed_attentions = nn.ModuleList([
+                CausalSelfAttention(config) for _ in range(self.num_steps)
+            ])
+        else:
+            self.fixed_attention_norms = None
+            self.fixed_attentions = None
+        self.temperature = float(config.cell_graph_temperature)
+        self.edge_override = None
+        self.last_node_probs = None
+        self.last_node_mask = None
+        self.last_edge_probs = None
+        self.last_edge_mask = None
+        self.last_depth = None
+
+    @staticmethod
+    def _ste_binary(probs, threshold):
+        hard = (probs >= threshold).to(probs.dtype)
+        return hard + probs - probs.detach(), hard
+
+    def _valid_source_mask(self, device):
+        # Source zero is the embedding anchor. Remaining source slots correspond
+        # to flattened cells; only cells from strictly earlier steps are legal.
+        valid = torch.zeros(self.num_cells, 1 + self.num_cells,
+                            dtype=torch.bool, device=device)
+        valid[:, 0] = True
+        for node in range(self.num_cells):
+            step = node // self.cells_per_step
+            valid[node, 1:1 + step * self.cells_per_step] = True
+        return valid
+
+    def forward(self, anchor):
+        B, T, _ = anchor.shape
+        node_logits, edge_logits = self.router(anchor)
+        temperature = max(float(self.temperature), 1e-4)
+        node_probs = torch.sigmoid(node_logits / temperature)
+        if self.config.cell_graph_fixed_active_cells > 0:
+            template = torch.zeros_like(node_probs)
+            for step in range(self.num_steps):
+                start = step * self.cells_per_step
+                template[..., start:start + self.config.cell_graph_fixed_active_cells] = 1.0
+            node_probs = template
+            node_gates = template
+            node_hard = template
+        else:
+            node_gates, node_hard = self._ste_binary(
+                node_probs, self.config.cell_graph_node_threshold
+            )
+        edge_probs = torch.sigmoid(edge_logits / temperature)
+        valid_static = self._valid_source_mask(anchor.device).view(
+            1, 1, self.num_cells, 1 + self.num_cells
+        )
+        edge_probs = edge_probs * valid_static.to(edge_probs.dtype)
+
+        source_states = [anchor]
+        source_available = [torch.ones(B, T, device=anchor.device, dtype=anchor.dtype)]
+        cell_outputs = []
+        edge_hard_records = []
+        current = anchor
+        for step in range(self.num_steps):
+            if self.fixed_attentions is not None:
+                current = current + self.fixed_attentions[step](
+                    self.fixed_attention_norms[step](current)
+                )
+            # Source zero means the current backbone state. Earlier Cell outputs
+            # remain addressable in their stable flattened source slots.
+            if self.fixed_attentions is not None:
+                source_states[0] = current
+            step_outputs = []
+            step_gates = []
+            for offset in range(self.cells_per_step):
+                node = step * self.cells_per_step + offset
+                available = torch.stack(source_available, dim=-1)
+                probs = edge_probs[:, :, node, :len(source_states)] * available
+                if self.config.cell_graph_edge_mode == "fixed":
+                    edge_hard = torch.zeros_like(probs)
+                    edge_hard[..., 0] = 1.0
+                    edge_gates = edge_hard
+                else:
+                    edge_gates, edge_hard = self._ste_binary(
+                        probs, self.config.cell_graph_edge_threshold
+                    )
+                if self.edge_override is not None:
+                    override = self.edge_override.to(device=anchor.device)
+                    if override.dim() == 2:
+                        chosen = override[node, :len(source_states)].view(
+                            1, 1, -1
+                        ).expand(B, T, -1)
+                    elif override.dim() == 4:
+                        chosen = override[:, :, node, :len(source_states)]
+                        if chosen.shape[:2] != (B, T):
+                            raise ValueError("cell graph edge override batch/sequence shape mismatch")
+                    else:
+                        raise ValueError("cell graph edge override must have shape [N,S] or [B,T,N,S]")
+                    edge_hard = chosen.to(probs.dtype) * available
+                    edge_gates = edge_hard
+                # Every active node must have an input. Anchor is a safe causal
+                # fallback and keeps the graph defined at initialization.
+                empty = edge_hard.sum(dim=-1, keepdim=True) == 0
+                fallback = torch.zeros_like(edge_hard)
+                fallback[..., 0] = 1.0
+                edge_hard = torch.where(empty, fallback, edge_hard)
+                edge_gates = torch.where(empty, fallback, edge_gates)
+                weights = edge_gates / edge_gates.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                sources = torch.stack(source_states, dim=2)
+                fused = torch.einsum("bts,btsc->btc", weights, sources)
+                if (self.config.cell_graph_fixed_active_cells > 0
+                        and offset >= self.config.cell_graph_fixed_active_cells):
+                    # In the fixed-compute protocol these nodes are structurally
+                    # absent, so evaluating their Cell body cannot affect output.
+                    output = current
+                else:
+                    output = self.cells[node](fused, current)
+                gate = node_gates[:, :, node]
+                step_outputs.append(output)
+                step_gates.append(gate)
+                cell_outputs.append(output)
+                source_states.append(output)
+                source_available.append(node_hard[:, :, node])
+                padded_edge = F.pad(edge_hard, (0, 1 + self.num_cells - edge_hard.size(-1)))
+                edge_hard_records.append(padded_edge)
+
+            gates = torch.stack(step_gates, dim=-1)
+            outputs = torch.stack(step_outputs, dim=2)
+            gate_sum = gates.sum(dim=-1, keepdim=True)
+            mixed = (outputs * gates.unsqueeze(-1)).sum(dim=2) / gate_sum.clamp_min(1e-6)
+            stage_active = 1.0 - torch.prod(1.0 - gates, dim=-1, keepdim=True)
+            current = current + stage_active * (mixed - current)
+
+        edge_hard = torch.stack(edge_hard_records, dim=2)
+        self.last_node_probs = node_probs
+        self.last_node_mask = node_hard.detach()
+        self.last_edge_probs = edge_probs
+        self.last_edge_mask = edge_hard.detach()
+        self.last_depth = self._hard_depth(node_hard.detach(), edge_hard.detach())
+        return current
+
+    def _hard_depth(self, node_mask, edge_mask):
+        depths = [torch.zeros_like(node_mask[..., 0])]
+        for node in range(self.num_cells):
+            selected = edge_mask[:, :, node, :node + 1].bool()
+            prior_depths = torch.stack(depths, dim=-1)
+            parent_depth = prior_depths.masked_fill(~selected, -1).max(dim=-1).values.clamp_min(0)
+            depths.append((parent_depth + 1) * node_mask[:, :, node])
+        return torch.stack(depths[1:], dim=-1).max(dim=-1).values
+
+
+class CellGraphRMSNorm(nn.Module):
+    """Small dependency-free RMSNorm used at the Full-Free Cell interface."""
+
+    def __init__(self, size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(size))
+        self.eps = eps
+
+    def forward(self, x):
+        scale = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return (x * scale.to(x.dtype)) * self.weight
+
+
+class FullFreeGraphRouter(nn.Module):
+    """Cheap shared context plus local node/source competition scorers."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_steps = config.n_layer
+        self.cells_per_step = config.cell_graph_cells_per_step
+        self.num_cells = self.num_steps * self.cells_per_step
+        self.hidden = config.cell_graph_router_hidden
+        self.max_sources = 1 + config.cell_graph_lookback_steps * self.cells_per_step
+        self.context_norm = LayerNorm(config.n_embd, bias=config.bias)
+        self.context_down = nn.Linear(config.n_embd, self.hidden, bias=config.bias)
+        self.state_down = nn.Linear(config.n_embd, self.hidden, bias=False)
+        self.source_down = nn.Linear(config.n_embd, self.hidden, bias=False)
+        self.node_keys = nn.Parameter(torch.empty(
+            self.num_steps, self.cells_per_step + 1 + int(config.cell_graph_halt), self.hidden
+        ))
+        self.node_bias = nn.Parameter(torch.zeros(
+            self.num_steps, self.cells_per_step + 1 + int(config.cell_graph_halt)
+        ))
+        self.edge_node_keys = nn.Parameter(torch.empty(self.num_cells, self.hidden))
+        self.edge_local_keys = nn.Parameter(torch.empty(
+            self.num_cells, self.max_sources, self.hidden
+        ))
+        nn.init.normal_(self.node_keys, std=0.02)
+        nn.init.normal_(self.edge_node_keys, std=0.02)
+        nn.init.normal_(self.edge_local_keys, std=0.02)
+
+    @staticmethod
+    def sparsemax(logits, dim=-1):
+        """Projection onto the probability simplex, with exact zero entries."""
+        shifted = logits - logits.max(dim=dim, keepdim=True).values
+        sorted_logits = shifted.sort(dim=dim, descending=True).values
+        size = logits.size(dim)
+        ranks = torch.arange(1, size + 1, device=logits.device, dtype=logits.dtype)
+        shape = [1] * logits.dim()
+        shape[dim] = size
+        ranks = ranks.view(shape)
+        cumulative = sorted_logits.cumsum(dim)
+        support = 1 + ranks * sorted_logits > cumulative
+        support_size = support.sum(dim=dim, keepdim=True).clamp_min(1)
+        tau = (cumulative.gather(dim, support_size - 1) - 1) / support_size.to(logits.dtype)
+        return (shifted - tau).clamp_min(0)
+
+    @staticmethod
+    def entmax15(logits, dim=-1):
+        """Exact alpha=1.5 entmax; optional alternative to sparsemax."""
+        shifted = logits / 2
+        shifted = shifted - shifted.max(dim=dim, keepdim=True).values
+        sorted_logits = shifted.sort(dim=dim, descending=True).values
+        size = logits.size(dim)
+        ranks = torch.arange(1, size + 1, device=logits.device, dtype=logits.dtype)
+        shape = [1] * logits.dim()
+        shape[dim] = size
+        ranks = ranks.view(shape)
+        mean = sorted_logits.cumsum(dim) / ranks
+        mean_sq = sorted_logits.square().cumsum(dim) / ranks
+        delta = (1 - ranks * (mean_sq - mean.square())) / ranks
+        taus = mean - delta.clamp_min(0).sqrt()
+        support = taus <= sorted_logits
+        support_size = support.sum(dim=dim, keepdim=True).clamp_min(1)
+        tau = taus.gather(dim, support_size - 1)
+        return (shifted - tau).clamp_min(0).square()
+
+    @classmethod
+    def select(cls, logits, method, dim=-1):
+        if method == "sparsemax":
+            return cls.sparsemax(logits, dim=dim)
+        if method == "entmax15":
+            return cls.entmax15(logits, dim=dim)
+        raise ValueError(f"unknown Full-Free selector: {method}")
+
+    def graph_context(self, anchor):
+        return F.gelu(self.context_down(self.context_norm(anchor)))
+
+    def node_weights(self, local, step, temperature, selector="sparsemax"):
+        scores = torch.einsum("bth,kh->btk", local, self.node_keys[step])
+        scores = scores / math.sqrt(self.hidden) + self.node_bias[step]
+        return self.select(scores / temperature, selector, dim=-1), scores
+
+    def edge_weights(self, local, source_features, available, node, temperature,
+                     selector="sparsemax"):
+        source_count = source_features.size(2)
+        query = local + self.edge_node_keys[node]
+        source_keys = source_features + self.edge_local_keys[node, :source_count]
+        scores = torch.einsum("bth,btsh->bts", query, source_keys) / math.sqrt(self.hidden)
+        scores = scores.masked_fill(~available, torch.finfo(scores.dtype).min)
+        return self.select(scores / temperature, selector, dim=-1), scores
+
+    def edge_weights_step(self, local, source_features, available, node_start,
+                          temperature, selector="sparsemax"):
+        """Score all Cells in one Step together to avoid one router kernel per Cell."""
+        source_count = source_features.size(2)
+        node_slice = slice(node_start, node_start + self.cells_per_step)
+        queries = local.unsqueeze(2) + self.edge_node_keys[node_slice].view(
+            1, 1, self.cells_per_step, self.hidden
+        )
+        source_keys = source_features.unsqueeze(2) + self.edge_local_keys[
+            node_slice, :source_count
+        ].view(1, 1, self.cells_per_step, source_count, self.hidden)
+        scores = torch.einsum("btmh,btmsh->btms", queries, source_keys)
+        scores = scores / math.sqrt(self.hidden)
+        scores = scores.masked_fill(
+            ~available.unsqueeze(2), torch.finfo(scores.dtype).min
+        )
+        return self.select(scores / temperature, selector, dim=-1), scores
+
+
+class FullFreeComputeCell(nn.Module):
+    """Fixed 128->64->128-style atom that returns a residual delta."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.down = nn.Linear(config.n_embd, config.cell_graph_atom_size, bias=config.bias)
+        self.up = nn.Linear(config.cell_graph_atom_size, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, fused):
+        return self.dropout(self.up(F.gelu(self.down(fused))))
+
+
+class FullFreeDynamicCellGraph(nn.Module):
+    """Full-Free research graph: sparse nodes and edges inside a fixed envelope."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.num_steps = config.n_layer
+        self.cells_per_step = config.cell_graph_cells_per_step
+        self.num_cells = self.num_steps * self.cells_per_step
+        self.lookback_steps = config.cell_graph_lookback_steps
+        self.router = FullFreeGraphRouter(config)
+        self.cells = nn.ModuleList([FullFreeComputeCell(config) for _ in range(self.num_cells)])
+        self.input_norms = nn.ModuleList([
+            CellGraphRMSNorm(config.n_embd) for _ in range(self.num_cells)
+        ])
+        max_sources = 1 + self.lookback_steps * self.cells_per_step
+        if config.cell_graph_input_projection == "linear":
+            self.input_projections = nn.ModuleList([
+                nn.ModuleList([
+                    nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+                    for _ in range(max_sources)
+                ]) for _ in range(self.num_cells)
+            ])
+        else:
+            self.input_projections = None
+        self.fixed_attention_norms = nn.ModuleList([
+            LayerNorm(config.n_embd, bias=config.bias) for _ in range(self.num_steps)
+        ])
+        self.fixed_attentions = nn.ModuleList([
+            CausalSelfAttention(config) for _ in range(self.num_steps)
+        ])
+        self.temperature = float(config.cell_graph_temperature)
+        self.exploration = float(config.cell_graph_exploration)
+        self.node_override = None
+        self.edge_override = None
+        self.last_node_probs = None
+        self.last_node_mask = None
+        self.last_edge_probs = None
+        self.last_edge_mask = None
+        self.last_depth = None
+        self.last_halt_weights = None
+        self.last_node_scores = None
+        self.last_edge_scores = None
+
+    def _candidate_indices(self, step):
+        start_step = max(0, step - self.lookback_steps)
+        return [0] + [
+            1 + prior_step * self.cells_per_step + cell
+            for prior_step in range(start_step, step)
+            for cell in range(self.cells_per_step)
+        ]
+
+    def route_only(self, anchor):
+        """Benchmarkable router-only workload; it does not execute Attention or Cells."""
+        B, T, _ = anchor.shape
+        temperature = max(float(self.temperature), 1e-4)
+        context = self.router.graph_context(anchor)
+        local = context + self.router.state_down(anchor)
+        source_feature = self.router.source_down(anchor)
+        checksum = context.sum() * 0.0
+        for step in range(self.num_steps):
+            weights, scores = self.router.node_weights(
+                local, step, temperature, self.config.cell_graph_node_selector
+            )
+            checksum = checksum + weights.sum() + scores.sum() * 0.0
+            source_count = len(self._candidate_indices(step))
+            sources = source_feature.unsqueeze(2).expand(B, T, source_count, source_feature.size(-1))
+            available = torch.ones(B, T, source_count, dtype=torch.bool, device=anchor.device)
+            edge_weights, edge_scores = self.router.edge_weights_step(
+                local, sources, available, step * self.cells_per_step, temperature,
+                self.config.cell_graph_edge_selector,
+            )
+            checksum = checksum + edge_weights.sum() + edge_scores.sum() * 0.0
+        return checksum
+
+    def _valid_source_mask(self, device):
+        valid = torch.zeros(self.num_cells, 1 + self.num_cells, dtype=torch.bool, device=device)
+        for node in range(self.num_cells):
+            step = node // self.cells_per_step
+            valid[node, self._candidate_indices(step)] = True
+        return valid
+
+    def _project_sources(self, node, sources):
+        if self.input_projections is None:
+            return sources
+        return torch.stack([
+            self.input_projections[node][slot](sources[:, :, slot])
+            for slot in range(sources.size(2))
+        ], dim=2)
+
+    def _override_nodes(self, weights, step, B, T):
+        if self.node_override is None:
+            return weights
+        override = self.node_override.to(device=weights.device, dtype=weights.dtype)
+        start = step * self.cells_per_step
+        if override.dim() == 1:
+            return override[start:start + self.cells_per_step].view(1, 1, -1).expand(B, T, -1)
+        if override.dim() == 3:
+            if override.shape[:2] != (B, T):
+                raise ValueError("cell graph node override batch/sequence shape mismatch")
+            return override[:, :, start:start + self.cells_per_step]
+        raise ValueError("cell graph node override must have shape [N] or [B,T,N]")
+
+    def _override_edges(self, weights, node, candidate_indices, B, T):
+        if self.edge_override is None:
+            return weights
+        override = self.edge_override.to(device=weights.device, dtype=weights.dtype)
+        if override.dim() == 2:
+            chosen = override[node, candidate_indices].view(1, 1, -1).expand(B, T, -1)
+        elif override.dim() == 4:
+            if override.shape[:2] != (B, T):
+                raise ValueError("cell graph edge override batch/sequence shape mismatch")
+            chosen = override[:, :, node, candidate_indices]
+        else:
+            raise ValueError("cell graph edge override must have shape [N,S] or [B,T,N,S]")
+        total = chosen.sum(dim=-1, keepdim=True)
+        fallback = torch.zeros_like(chosen)
+        fallback[..., 0] = 1.0
+        return torch.where(total > 0, chosen / total.clamp_min(1e-6), fallback)
+
+    def forward(self, anchor):
+        B, T, _ = anchor.shape
+        temperature = max(float(self.temperature), 1e-4)
+        context = self.router.graph_context(anchor)
+        current = anchor
+        cell_outputs = [None] * self.num_cells
+        cell_source_features = [None] * self.num_cells
+        cell_available = [None] * self.num_cells
+        node_weights_records = []
+        node_mask_records = []
+        edge_weights_records = []
+        edge_mask_records = []
+        node_score_records = []
+        edge_score_records = []
+        halt_records = []
+        alive = torch.ones(B, T, device=anchor.device, dtype=anchor.dtype)
+
+        for step in range(self.num_steps):
+            current = current + self.fixed_attentions[step](self.fixed_attention_norms[step](current))
+            local_context = context + self.router.state_down(current)
+            routed, node_scores = self.router.node_weights(
+                local_context, step, temperature, self.config.cell_graph_node_selector
+            )
+            cell_weights = routed[..., :self.cells_per_step]
+            halt_weight = (routed[..., -1] if self.config.cell_graph_halt
+                           else torch.zeros_like(alive))
+            cell_weights = cell_weights * alive.unsqueeze(-1)
+            if self.training and self.exploration > 0:
+                explore = torch.rand(B, T, 1, device=anchor.device) < self.exploration
+                random_cells = F.one_hot(
+                    torch.randint(self.cells_per_step, (B, T), device=anchor.device),
+                    self.cells_per_step,
+                ).to(cell_weights.dtype)
+                cell_weights = torch.where(explore, random_cells * alive.unsqueeze(-1), cell_weights)
+            cell_weights = self._override_nodes(cell_weights, step, B, T) * alive.unsqueeze(-1)
+            node_masks = cell_weights > 0
+            step_deltas = []
+
+            candidate_indices = self._candidate_indices(step)
+            source_tensors = [current]
+            source_features = [self.router.source_down(current)]
+            source_available = [torch.ones(B, T, dtype=torch.bool, device=anchor.device)]
+            for source_index in candidate_indices[1:]:
+                prior_node = source_index - 1
+                source_tensors.append(cell_outputs[prior_node])
+                source_features.append(cell_source_features[prior_node])
+                source_available.append(cell_available[prior_node])
+            sources = torch.stack(source_tensors, dim=2)
+            routed_sources = torch.stack(source_features, dim=2)
+            available = torch.stack(source_available, dim=-1)
+            step_edge_weights, step_edge_scores = self.router.edge_weights_step(
+                local_context, routed_sources, available,
+                step * self.cells_per_step, temperature,
+                self.config.cell_graph_edge_selector,
+            )
+
+            for offset in range(self.cells_per_step):
+                node = step * self.cells_per_step + offset
+                edge_weights = step_edge_weights[..., offset, :]
+                edge_scores = step_edge_scores[..., offset, :]
+                edge_weights = self._override_edges(
+                    edge_weights, node, candidate_indices, B, T
+                )
+                edge_weights = edge_weights * available.to(edge_weights.dtype)
+                empty = edge_weights.sum(dim=-1, keepdim=True) == 0
+                fallback = torch.zeros_like(edge_weights)
+                fallback[..., 0] = 1.0
+                edge_weights = torch.where(empty, fallback, edge_weights)
+                edge_weights = edge_weights / edge_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                projected = self._project_sources(node, sources)
+                fused = (projected * edge_weights.unsqueeze(-1)).sum(dim=2)
+                fused = self.input_norms[node](fused)
+                delta = self.cells[node](fused)
+                step_deltas.append(delta)
+                cell_outputs[node] = delta
+                cell_source_features[node] = self.router.source_down(delta)
+                cell_available[node] = node_masks[..., offset]
+
+                padded_weights = torch.zeros(
+                    B, T, 1 + self.num_cells, device=anchor.device, dtype=edge_weights.dtype
+                )
+                padded_scores = torch.zeros(
+                    B, T, 1 + self.num_cells, device=anchor.device, dtype=edge_scores.dtype
+                )
+                padded_weights[..., candidate_indices] = edge_weights
+                padded_scores[..., candidate_indices] = edge_scores
+                edge_weights_records.append(padded_weights)
+                edge_mask_records.append((padded_weights > 0) & node_masks[..., offset, None])
+                edge_score_records.append(padded_scores)
+
+            deltas = torch.stack(step_deltas, dim=2)
+            current = current + (deltas * cell_weights.unsqueeze(-1)).sum(dim=2)
+            node_weights_records.append(cell_weights)
+            node_mask_records.append(node_masks)
+            node_score_records.append(node_scores[..., :self.cells_per_step])
+            halt_records.append(halt_weight * alive)
+            if self.config.cell_graph_halt:
+                alive = alive * (1.0 - halt_weight)
+
+        node_weights = torch.cat(node_weights_records, dim=-1)
+        node_mask = torch.cat(node_mask_records, dim=-1)
+        edge_weights = torch.stack(edge_weights_records, dim=2)
+        edge_mask = torch.stack(edge_mask_records, dim=2)
+        self.last_node_probs = node_weights
+        self.last_node_mask = node_mask.detach()
+        self.last_edge_probs = edge_weights
+        self.last_edge_mask = edge_mask.detach()
+        self.last_node_scores = torch.cat(node_score_records, dim=-1)
+        self.last_edge_scores = torch.stack(edge_score_records, dim=2)
+        self.last_halt_weights = torch.stack(halt_records, dim=-1)
+        self.last_depth = self._hard_depth(node_mask.detach(), edge_mask.detach())
+        return current
+
+    def _hard_depth(self, node_mask, edge_mask):
+        depths = [torch.zeros_like(node_mask[..., 0])]
+        for node in range(self.num_cells):
+            selected = edge_mask[:, :, node, :node + 1].bool()
+            prior_depths = torch.stack(depths, dim=-1)
+            parent_depth = prior_depths.masked_fill(~selected, -1).max(dim=-1).values.clamp_min(0)
+            depths.append((parent_depth + 1) * node_mask[:, :, node])
+        if not depths[1:]:
+            return torch.zeros_like(node_mask[..., 0], dtype=torch.float)
+        self.last_node_depths = torch.stack(depths[1:], dim=-1)
+        return self.last_node_depths.max(dim=-1).values
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -1197,6 +1960,44 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    free_q: bool = False
+    free_q_selector: str = "binary" # "binary" or "sparsemax"
+    free_q_source_projection: str = "identity" # "identity" or "linear"
+    free_q_threshold: float = 0.5
+    free_q_temperature: float = 1.0
+    cell_graph: bool = False
+    cell_graph_mode: str = "legacy" # "legacy" or isolated "full_free"
+    cell_graph_cells_per_step: int = 4
+    cell_graph_attention_cells: int = 1
+    cell_graph_fixed_attention: bool = False
+    cell_graph_fixed_active_cells: int = 0
+    cell_graph_edge_mode: str = "learned" # "learned" or canonical "fixed"
+    cell_graph_atom_size: int = 64
+    cell_graph_temperature: float = 1.0
+    cell_graph_temperature_final: float = 0.5
+    cell_graph_temperature_anneal_iters: int = 1000
+    cell_graph_node_threshold: float = 0.5
+    cell_graph_edge_threshold: float = 0.5
+    cell_graph_target_node_ratio: float = 0.5
+    cell_graph_budget_weight: float = 0.1
+    cell_graph_edge_cost_weight: float = 0.01
+    cell_graph_balance_weight: float = 0.01
+    cell_graph_router_hidden: int = 32
+    cell_graph_lookback_steps: int = 3
+    cell_graph_input_projection: str = "identity" # "identity" or "linear"
+    cell_graph_node_selector: str = "sparsemax"
+    cell_graph_edge_selector: str = "sparsemax"
+    cell_graph_halt: bool = False
+    cell_graph_exploration: float = 0.0
+    cell_graph_exploration_final: float = 0.0
+    cell_graph_exploration_anneal_iters: int = 0
+    cell_graph_budget_mode: str = "none" # "none" or "dual_active_cells"
+    cell_graph_active_cell_budget: float = 16.0
+    cell_graph_dual_lr: float = 0.01
+    cell_graph_dual_init: float = 0.0
+    cell_graph_dual_value: float = 0.0
+    cell_graph_support_temperature: float = 0.05
+    cell_graph_static_graph_path: str = ""
     dynamic_exit: bool = False
     exit_layers: list = None # 1-indexed transformer layers, e.g. [3, 6, 9]
     confidence_method: str = "max_prob" # "max_prob" or "entropy"
@@ -1324,6 +2125,28 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        assert config.free_q_selector in ("binary", "sparsemax")
+        assert config.free_q_source_projection in ("identity", "linear")
+        assert 0.0 < config.free_q_threshold < 1.0
+        assert config.cell_graph_cells_per_step > 0
+        assert config.cell_graph_mode in ("legacy", "full_free")
+        assert 0 <= config.cell_graph_attention_cells <= config.cell_graph_cells_per_step
+        assert 0 <= config.cell_graph_fixed_active_cells <= config.cell_graph_cells_per_step
+        assert config.cell_graph_edge_mode in ("learned", "fixed")
+        assert config.cell_graph_atom_size > 0
+        assert 0.0 < config.cell_graph_node_threshold < 1.0
+        assert 0.0 < config.cell_graph_edge_threshold < 1.0
+        assert 0.0 <= config.cell_graph_target_node_ratio <= 1.0
+        assert config.cell_graph_router_hidden > 0
+        assert config.cell_graph_lookback_steps >= 0
+        assert config.cell_graph_input_projection in ("identity", "linear")
+        assert config.cell_graph_node_selector in ("sparsemax", "entmax15")
+        assert config.cell_graph_edge_selector in ("sparsemax", "entmax15")
+        assert 0.0 <= config.cell_graph_exploration <= 1.0
+        assert 0.0 <= config.cell_graph_exploration_final <= 1.0
+        assert config.cell_graph_budget_mode in ("none", "dual_active_cells")
+        assert config.cell_graph_active_cell_budget >= 0.0
+        assert config.cell_graph_support_temperature > 0.0
         config.dynamic_width = bool(config.dynamic_width or config.enable_dynamic_width)
         if config.dynamic_depth_choices is None:
             config.dynamic_depth_choices = [2, 3, 4]
@@ -1334,6 +2157,25 @@ class GPT(nn.Module):
         config.dynamic_resource_widths = [int(width) for width in config.dynamic_resource_widths]
         assert sum([config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp, config.block_sparse_mlp, config.block_precision_mlp, config.resource_mode_mlp, config.hardware_atom_mlp, config.dynamic_resource]) <= 1, \
             "dynamic MLP variants are mutually exclusive"
+        if config.free_q:
+            assert not any([
+                config.dynamic_exit, config.enable_dynamic_depth, config.dynamic_resource,
+                config.dynamic_mlp, config.dynamic_width, config.free_channel_mlp,
+                config.block_sparse_mlp, config.block_precision_mlp,
+                config.resource_mode_mlp, config.hardware_atom_mlp,
+            ]), "Free-Q must be isolated from depth, width, exit, and MLP routing"
+        if config.cell_graph:
+            assert not any([
+                config.free_q, config.dynamic_exit, config.enable_dynamic_depth,
+                config.dynamic_resource, config.dynamic_mlp, config.dynamic_width,
+                config.free_channel_mlp, config.block_sparse_mlp,
+                config.block_precision_mlp, config.resource_mode_mlp,
+                config.hardware_atom_mlp,
+            ]), "cell_graph is a standalone architecture and cannot use legacy routers"
+            if config.cell_graph_mode == "full_free":
+                assert config.cell_graph_fixed_attention, "Full-Free v1 requires fixed standard attention"
+                assert config.cell_graph_fixed_active_cells == 0, "Full-Free cannot use fixed active cells"
+                assert config.cell_graph_edge_mode == "learned", "Full-Free requires learned sparse edges"
         if config.dynamic_resource:
             assert not config.enable_dynamic_depth and not config.dynamic_exit, \
                 "dynamic_resource cannot be combined with depth/exit routing"
@@ -1387,9 +2229,14 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([] if config.cell_graph else [Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        self.cell_graph = (
+            (FullFreeDynamicCellGraph(config)
+             if config.cell_graph_mode == "full_free" else DynamicCellGraph(config))
+            if config.cell_graph else None
+        )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.exit_layers = self._normalize_exit_layers(config.exit_layers) if config.dynamic_exit else []
         self.exit_heads = nn.ModuleDict()
@@ -1420,6 +2267,8 @@ class GPT(nn.Module):
         self.last_dynamic_resource_probs = None
         self.last_dynamic_resource_modes = None
         self.last_dynamic_resource_stats = None
+        self.last_free_q_stats = None
+        self.last_cell_graph_stats = None
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -1445,6 +2294,13 @@ class GPT(nn.Module):
                 f"depths={config.dynamic_depth_choices}, shared ln_f/lm_head, "
                 f"compute_weight={config.dynamic_depth_compute_weight}"
             )
+        if config.free_q:
+            print(
+                "Free-Q enabled: "
+                f"selector={config.free_q_selector}, "
+                f"source_projection={config.free_q_source_projection}, "
+                "scope=token, compute_penalty=0"
+            )
         if config.dynamic_resource:
             print(
                 "dynamic resource enabled: "
@@ -1452,6 +2308,18 @@ class GPT(nn.Module):
                 f"paths={len(config.dynamic_resource_widths) ** config.n_layer}, "
                 f"skip={config.dynamic_resource_skip_mode}, "
                 f"routing={config.dynamic_resource_routing}"
+            )
+        if config.cell_graph:
+            attention_description = (
+                "fixed-backbone" if config.cell_graph_fixed_attention
+                else str(config.cell_graph_attention_cells)
+            )
+            print(
+                "dynamic Cell Graph enabled: "
+                f"mode={config.cell_graph_mode}, "
+                f"steps={config.n_layer}, cells/step={config.cell_graph_cells_per_step}, "
+                f"attention/step={attention_description}, "
+                f"atom={config.n_embd}->{config.cell_graph_atom_size}->{config.n_embd}"
             )
         if config.dynamic_mlp:
             print(
@@ -1568,6 +2436,141 @@ class GPT(nn.Module):
             raise ValueError(f"unknown confidence_method: {method}")
         return should_exit, confidence, max_prob, entropy
 
+    def free_q_route_records(self):
+        """Return detached per-layer route tensors for offline interventions."""
+        if not self.config.free_q:
+            return []
+        return [{
+            "layer": layer,
+            "probs": block.attn.last_q_source_probs,
+            "mask": block.attn.last_q_source_mask,
+            "weights": block.attn.last_q_source_weights,
+            "available": block.attn.last_q_source_available,
+        } for layer, block in enumerate(self.transformer.h)]
+
+    def set_free_q_overrides(self, overrides):
+        """Set one [H,S] or [B,T,H,S] hard mask per layer; None clears all."""
+        if not self.config.free_q:
+            raise RuntimeError("free_q is disabled")
+        if overrides is None:
+            for block in self.transformer.h:
+                block.attn.free_q_override = None
+            return
+        if len(overrides) != self.config.n_layer:
+            raise ValueError(f"expected {self.config.n_layer} Free-Q overrides")
+        for block, override in zip(self.transformer.h, overrides):
+            block.attn.free_q_override = override
+
+    @staticmethod
+    def _categorical_stats(ids):
+        _, counts = ids.unique(return_counts=True)
+        fractions = counts.float() / counts.sum().clamp_min(1)
+        entropy = -(fractions * fractions.clamp_min(1e-12).log()).sum().item()
+        sorted_fractions = fractions.sort(descending=True).values
+        return {
+            "unique_masks": int(counts.numel()),
+            "top1_mask_coverage": sorted_fractions[:1].sum().item(),
+            "top4_mask_coverage": sorted_fractions[:4].sum().item(),
+            "mask_entropy": entropy,
+        }
+
+    def _set_free_q_stats(self, token_ids=None, valid_mask=None):
+        if not self.config.free_q:
+            self.last_free_q_stats = None
+            return
+        source_names = ["current", "previous", "earlier", "anchor"]
+        layer_stats = []
+        global_masks = []
+        global_probs = []
+        global_tokens = []
+        bit_values = None
+        for layer, block in enumerate(self.transformer.h):
+            mask = block.attn.last_q_source_mask
+            probs = block.attn.last_q_source_probs
+            if mask is None:
+                continue
+            B, T, H, S = mask.shape
+            if bit_values is None:
+                bit_values = torch.tensor([1 << i for i in range(S)], device=mask.device)
+            valid = (torch.ones(B, T, dtype=torch.bool, device=mask.device)
+                     if valid_mask is None else valid_mask)
+            head_stats = []
+            for head in range(H):
+                head_mask = mask[:, :, head][valid]
+                head_probs = probs[:, :, head][valid]
+                mask_ids = (head_mask.long() * bit_values).sum(dim=-1)
+                stats = self._categorical_stats(mask_ids)
+                fanin = head_mask.sum(dim=-1)
+                stats.update({
+                    "layer": layer,
+                    "head": head,
+                    "available": {
+                        name: bool(block.attn.last_q_source_available[i].item())
+                        for i, name in enumerate(source_names)
+                    },
+                    "source_usage": {
+                        name: head_mask[:, i].float().mean().item()
+                        for i, name in enumerate(source_names)
+                    },
+                    "source_probability": {
+                        name: head_probs[:, i].float().mean().item()
+                        for i, name in enumerate(source_names)
+                    },
+                    "average_hard_fanin": fanin.float().mean().item(),
+                    "fanin_distribution": {
+                        str(k): (fanin == k).float().mean().item()
+                        for k in range(1, S + 1)
+                    },
+                })
+                if token_ids is not None:
+                    tokens = token_ids[valid]
+                    conditional = 0.0
+                    for token in tokens.unique():
+                        selected = mask_ids[tokens == token]
+                        weight = selected.numel() / max(mask_ids.numel(), 1)
+                        conditional += weight * self._categorical_stats(selected)["mask_entropy"]
+                    stats["conditional_mask_entropy_token"] = conditional
+                    stats["mask_token_mutual_information"] = stats["mask_entropy"] - conditional
+                head_stats.append(stats)
+                global_masks.append(head_mask)
+                global_probs.append(head_probs)
+                if token_ids is not None:
+                    global_tokens.append(token_ids[valid])
+            layer_stats.append({"layer": layer, "heads": head_stats})
+
+        masks = torch.cat(global_masks)
+        probs = torch.cat(global_probs)
+        mask_ids = (masks.long() * bit_values).sum(dim=-1)
+        fanin = masks.sum(dim=-1)
+        global_stats = self._categorical_stats(mask_ids)
+        global_stats.update({
+            "average_hard_fanin": fanin.float().mean().item(),
+            "fanin_distribution": {
+                str(k): (fanin == k).float().mean().item() for k in range(1, 5)
+            },
+            "source_usage": {
+                name: masks[:, i].float().mean().item()
+                for i, name in enumerate(source_names)
+            },
+            "source_probability": {
+                name: probs[:, i].float().mean().item()
+                for i, name in enumerate(source_names)
+            },
+        })
+        if global_tokens:
+            tokens = torch.cat(global_tokens)
+            conditional = 0.0
+            for token in tokens.unique():
+                selected = mask_ids[tokens == token]
+                conditional += (selected.numel() / mask_ids.numel()) * self._categorical_stats(selected)["mask_entropy"]
+            global_stats["conditional_mask_entropy_token"] = conditional
+            global_stats["mask_token_mutual_information"] = global_stats["mask_entropy"] - conditional
+        self.last_free_q_stats = {
+            "source_names": source_names,
+            **global_stats,
+            "layers": layer_stats,
+        }
+
     def _set_training_exit_stats(self, aux_losses):
         if aux_losses:
             self.last_exit_stats = {
@@ -1672,8 +2675,22 @@ class GPT(nn.Module):
                     mlp.external_mode_probs = address_probs[:, layer, :]
             exit_outputs = []
             depth_logits = {}
+            anchor = x
+            residual_states = [anchor]
             for layer_idx, block in enumerate(self.transformer.h, start=1):
-                x = block(x)
+                if self.config.free_q:
+                    # residual_states[-1] is x itself. Reach farther back so
+                    # "previous" is not a duplicate of the current block input.
+                    previous = residual_states[-2] if len(residual_states) >= 2 else None
+                    earlier = residual_states[-3] if len(residual_states) >= 3 else None
+                    if previous is anchor:
+                        previous = None
+                    if earlier is anchor:
+                        earlier = None
+                    x = block(x, q_history=[previous, earlier, anchor])
+                    residual_states.append(x)
+                else:
+                    x = block(x)
                 if self.config.dynamic_exit and targets is not None and layer_idx in self.exit_layers:
                     exit_logits = self.exit_heads[str(layer_idx)](x)
                     exit_outputs.append((layer_idx, exit_logits))
@@ -1691,6 +2708,7 @@ class GPT(nn.Module):
                 # index tensor created by list-based advanced indexing.
                 logits = self.lm_head(x[:, -1:, :])
             self.last_dynamic_depth_logits = depth_logits or None
+            self._set_free_q_stats(idx, targets != -1 if targets is not None else None)
             return logits, exit_outputs
         finally:
             for mlp, force in old_force:
@@ -2755,11 +3773,296 @@ class GPT(nn.Module):
         assert self.config.dynamic_resource
         return self._forward_dynamic_resource_logits(idx, forced_path=forced_path)
 
+    def set_cell_graph_temperature(self, temperature):
+        if self.cell_graph is not None:
+            self.config.cell_graph_temperature = float(temperature)
+            self.cell_graph.temperature = float(temperature)
+
+    def cell_graph_route_records(self):
+        """Detached hard/soft graph decisions from the most recent forward."""
+        if self.cell_graph is None or self.cell_graph.last_node_mask is None:
+            return None
+        records = {
+            "node_probs": self.cell_graph.last_node_probs.detach(),
+            "node_mask": self.cell_graph.last_node_mask,
+            "edge_probs": self.cell_graph.last_edge_probs.detach(),
+            "edge_mask": self.cell_graph.last_edge_mask,
+            "depth": self.cell_graph.last_depth,
+        }
+        for name in ("last_node_scores", "last_edge_scores", "last_halt_weights"):
+            value = getattr(self.cell_graph, name, None)
+            if value is not None:
+                records[name.removeprefix("last_")] = value.detach()
+        return records
+
+    def set_cell_graph_node_override(self, override):
+        """Fix/replay Full-Free Cell nodes as [N] or [B,T,N] weights."""
+        if self.cell_graph is None:
+            raise RuntimeError("cell_graph is disabled")
+        if not hasattr(self.cell_graph, "node_override"):
+            raise RuntimeError("node overrides require cell_graph_mode='full_free'")
+        self.cell_graph.node_override = override
+
+    def set_cell_graph_edge_override(self, override):
+        """Fix Cell edges to [N,S] or replay token routes [B,T,N,S]."""
+        if self.cell_graph is None:
+            raise RuntimeError("cell_graph is disabled")
+        self.cell_graph.edge_override = override
+
+    def set_cell_graph_overrides(self, node_override=None, edge_override=None):
+        """Atomically install a complete Full-Free graph intervention."""
+        self.set_cell_graph_node_override(node_override)
+        self.set_cell_graph_edge_override(edge_override)
+
+    def set_cell_graph_exploration(self, rate):
+        if isinstance(self.cell_graph, FullFreeDynamicCellGraph):
+            self.config.cell_graph_exploration = float(rate)
+            self.cell_graph.exploration = float(rate)
+
+    @torch.no_grad()
+    def update_cell_graph_dual(self):
+        """Projected dual ascent on the single average-active-cell constraint."""
+        if (self.config.cell_graph_budget_mode != "dual_active_cells"
+                or self.last_cell_graph_stats is None):
+            return self.config.cell_graph_dual_value
+        error = (self.last_cell_graph_stats["mean_active_cells"]
+                 - self.config.cell_graph_active_cell_budget) / self.cell_graph.num_cells
+        self.config.cell_graph_dual_value = max(
+            0.0, float(self.config.cell_graph_dual_value + self.config.cell_graph_dual_lr * error)
+        )
+        return self.config.cell_graph_dual_value
+
+    def _forward_cell_graph_logits(self, idx, all_logits=False):
+        device = idx.device
+        _, T = idx.shape
+        pos = torch.arange(T, dtype=torch.long, device=device)
+        anchor = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
+        hidden = self.cell_graph(anchor)
+        hidden = self.transformer.ln_f(hidden)
+        return self.lm_head(hidden if all_logits else hidden[:, -1:, :])
+
+    def _cell_graph_loss_terms(self, valid_mask):
+        graph = self.cell_graph
+        node_probs = graph.last_node_probs
+        edge_probs = graph.last_edge_probs
+        valid = valid_mask.unsqueeze(-1)
+        selected_nodes = node_probs[valid.expand_as(node_probs)]
+        if isinstance(graph, FullFreeDynamicCellGraph):
+            # Sparsemax weights live on a simplex, so their plain sum cannot
+            # estimate support size. This smooth support indicator approaches
+            # 1 for every positive activation and remains differentiable.
+            support = 1.0 - torch.exp(
+                -selected_nodes.float() / self.config.cell_graph_support_temperature
+            )
+            expected_node_ratio = support.mean()
+        else:
+            expected_node_ratio = selected_nodes.float().mean()
+        budget = (expected_node_ratio - self.config.cell_graph_target_node_ratio) ** 2
+
+        static_edges = graph._valid_source_mask(edge_probs.device).view(
+            1, 1, graph.num_cells, 1 + graph.num_cells
+        )
+        node_hard = graph.last_node_mask.bool()
+        source_hard = torch.cat([
+            torch.ones_like(node_hard[..., :1]), node_hard
+        ], dim=-1)
+        edge_valid = (static_edges
+                      & valid.unsqueeze(-1)
+                      & node_hard.unsqueeze(-1)
+                      & source_hard.unsqueeze(-2))
+        edge_cost = edge_probs[edge_valid.expand_as(edge_probs)].float().mean()
+
+        token_valid = valid_mask.unsqueeze(-1).expand_as(node_probs)
+        usage = node_probs.masked_select(token_valid).view(-1, graph.num_cells).float().mean(dim=0)
+        balance = usage.var(unbiased=False)
+        return budget, edge_cost, balance, expected_node_ratio
+
+    def _set_cell_graph_stats(self, valid_mask=None):
+        graph = self.cell_graph
+        if graph is None or graph.last_node_mask is None:
+            self.last_cell_graph_stats = None
+            return
+        node_mask = graph.last_node_mask.bool()
+        edge_mask = graph.last_edge_mask.bool()
+        depth = graph.last_depth.float()
+        if valid_mask is None:
+            valid_mask = torch.ones_like(depth, dtype=torch.bool)
+        nodes = node_mask[valid_mask]
+        edges = edge_mask[valid_mask]
+        depths = depth[valid_mask]
+        widths = nodes.view(-1, graph.num_steps, graph.cells_per_step).sum(dim=-1).float()
+        active_edge_counts = edges.sum(dim=-1).float()[nodes]
+        if active_edge_counts.numel() == 0:
+            active_edge_counts = edges.new_zeros(1, dtype=torch.float)
+        unique_graphs = torch.unique(nodes, dim=0).size(0)
+        node_usage = nodes.float().mean(dim=0)
+        self.last_cell_graph_stats = {
+            "num_steps": graph.num_steps,
+            "cells_per_step": graph.cells_per_step,
+            "num_cells": graph.num_cells,
+            "mean_active_cells": nodes.float().sum(dim=-1).mean().item(),
+            "std_active_cells": nodes.float().sum(dim=-1).std(unbiased=False).item(),
+            "min_active_cells": nodes.float().sum(dim=-1).min().item(),
+            "max_active_cells": nodes.float().sum(dim=-1).max().item(),
+            "mean_active_ratio": nodes.float().mean().item(),
+            "mean_depth": depths.mean().item(),
+            "std_depth": depths.std(unbiased=False).item(),
+            "min_depth": depths.min().item(),
+            "max_depth": depths.max().item(),
+            "mean_fanin": active_edge_counts.mean().item(),
+            "mean_width": widths.mean().item(),
+            "step_widths": [value.item() for value in widths.mean(dim=0)],
+            "empty_step_fraction": (widths == 0).float().mean().item(),
+            "step_empty_fractions": [value.item() for value in (widths == 0).float().mean(dim=0)],
+            "node_usage": node_usage.detach().cpu(),
+            "node_usage_std": node_usage.std(unbiased=False).item(),
+            "unique_node_graphs": int(unique_graphs),
+            "tokens": int(nodes.size(0)),
+        }
+        if isinstance(graph, FullFreeDynamicCellGraph):
+            active_edges = edges.sum(dim=(-1, -2)).float()
+            soft_edges = graph.last_edge_probs.detach()[valid_mask]
+            soft_fanin = soft_edges.sum(dim=-1)[nodes]
+            if soft_fanin.numel() == 0:
+                soft_fanin = active_edge_counts.new_zeros(1)
+            usage_sum = node_usage.sum().clamp_min(1e-12)
+            usage_distribution = node_usage / usage_sum
+            node_usage_entropy = -(
+                usage_distribution * usage_distribution.clamp_min(1e-12).log()
+            ).sum().item()
+            ordered_usage = node_usage.sort().values
+            count = max(ordered_usage.numel(), 1)
+            ranks = torch.arange(1, count + 1, device=ordered_usage.device, dtype=ordered_usage.dtype)
+            gini = ((2 * ranks - count - 1) * ordered_usage).sum()
+            gini = (gini / (count * ordered_usage.sum().clamp_min(1e-12))).item()
+            edge_usage = edges.float().mean(dim=0).reshape(-1)
+            edge_usage = edge_usage[edge_usage > 0]
+            edge_distribution = edge_usage / edge_usage.sum().clamp_min(1e-12)
+            edge_usage_entropy = -(
+                edge_distribution * edge_distribution.clamp_min(1e-12).log()
+            ).sum().item() if edge_distribution.numel() else 0.0
+            historical_edges = edges[..., 1:].sum(dim=(-1, -2)).float()
+            active_counts = nodes.sum(dim=-1).float()
+            node_depths = graph.last_node_depths[valid_mask]
+            active_depth_values = node_depths[nodes]
+            if active_depth_values.numel() == 0:
+                active_depth_values = depths.new_zeros(1)
+            cell_macs = 2 * self.config.n_embd * self.config.cell_graph_atom_size
+            valid_edge_slots = int(graph._valid_source_mask(nodes.device).sum().item())
+            router_macs = (
+                (1 + 2 * graph.num_steps + graph.num_cells)
+                * self.config.n_embd * self.config.cell_graph_router_hidden
+                + (graph.num_steps * (graph.cells_per_step + 1) + valid_edge_slots)
+                * self.config.cell_graph_router_hidden
+            )
+            self.last_cell_graph_stats.update({
+                "mean_active_edges": active_edges.mean().item(),
+                "mean_soft_fanin": soft_fanin.float().mean().item(),
+                "average_path_length": active_depth_values.float().mean().item(),
+                "longest_path": depths.max().item(),
+                "average_branching_factor": (historical_edges / active_counts.clamp_min(1)).mean().item(),
+                "average_merge_factor": (historical_edges / active_counts.clamp_min(1)).mean().item(),
+                "node_usage_entropy": node_usage_entropy,
+                "edge_usage_entropy": edge_usage_entropy,
+                "dead_cell_ratio": (node_usage == 0).float().mean().item(),
+                "node_usage_gini": gini,
+                "theoretical_active_cell_macs": active_counts.mean().item() * cell_macs,
+                "theoretical_skipped_cell_macs": (graph.num_cells - active_counts.mean().item()) * cell_macs,
+                "router_parameters": sum(p.numel() for p in graph.router.parameters()),
+                "router_theoretical_macs_per_token": int(router_macs),
+                "dual_value": float(self.config.cell_graph_dual_value),
+                "node_score_std": graph.last_node_scores.detach()[valid_mask].float().std(unbiased=False).item(),
+                "edge_score_std": graph.last_edge_scores.detach()[valid_mask].float().std(unbiased=False).item(),
+            })
+        if not self.training or isinstance(graph, FullFreeDynamicCellGraph):
+            def diversity(mask_rows):
+                _, counts = torch.unique(mask_rows, dim=0, return_counts=True)
+                fractions = counts.float() / counts.sum().clamp_min(1)
+                ordered = fractions.sort(descending=True).values
+                return {
+                    "entropy": (-(fractions * fractions.clamp_min(1e-12).log()).sum().item()),
+                    "unique": int(counts.numel()),
+                    "top1": ordered[:1].sum().item(),
+                    "top4": ordered[:4].sum().item(),
+                    "top8": ordered[:8].sum().item(),
+                    "top16": ordered[:16].sum().item(),
+                }
+
+            routed_edges = edges & nodes.unsqueeze(-1)
+            global_diversity = diversity(routed_edges.reshape(routed_edges.size(0), -1))
+            per_cell = []
+            for node in range(graph.num_cells):
+                active_rows = nodes[:, node]
+                if active_rows.any():
+                    values = edges[active_rows][:, node]
+                    cell_diversity = diversity(values)
+                    cell_diversity.update({
+                        "node": node,
+                        "step": node // graph.cells_per_step,
+                        "cell": node % graph.cells_per_step,
+                        "mean_fanin": values.sum(dim=-1).float().mean().item(),
+                    })
+                    per_cell.append(cell_diversity)
+            per_step = []
+            for step in range(graph.num_steps):
+                start = step * graph.cells_per_step
+                values = routed_edges[:, start:start + graph.cells_per_step].reshape(
+                    routed_edges.size(0), -1
+                )
+                step_diversity = diversity(values)
+                step_diversity["step"] = step
+                per_step.append(step_diversity)
+            self.last_cell_graph_stats.update({
+                "edge_graph_entropy": global_diversity["entropy"],
+                "edge_graph_top1_coverage": global_diversity["top1"],
+                "edge_graph_top4_coverage": global_diversity["top4"],
+                "edge_graph_top8_coverage": global_diversity["top8"],
+                "edge_graph_top16_coverage": global_diversity["top16"],
+                "edge_graph_unique": global_diversity["unique"],
+                "edge_diversity_by_cell": per_cell,
+                "edge_diversity_by_step": per_step,
+            })
+
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        if self.config.cell_graph:
+            logits = self._forward_cell_graph_logits(idx, all_logits=targets is not None)
+            valid = targets != -1 if targets is not None else None
+            self._set_cell_graph_stats(valid)
+            if targets is None:
+                self.last_loss_stats = None
+                return logits, None
+            task_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
+            )
+            budget, edge_cost, balance, expected_node_ratio = self._cell_graph_loss_terms(valid)
+            expected_active_cells = expected_node_ratio * self.cell_graph.num_cells
+            dual_penalty = expected_active_cells.new_zeros(())
+            if self.config.cell_graph_budget_mode == "dual_active_cells":
+                dual_penalty = self.config.cell_graph_dual_value * (
+                    expected_active_cells - self.config.cell_graph_active_cell_budget
+                ) / self.cell_graph.num_cells
+            loss = (task_loss
+                    + self.config.cell_graph_budget_weight * budget
+                    + self.config.cell_graph_edge_cost_weight * edge_cost
+                    + self.config.cell_graph_balance_weight * balance
+                    + dual_penalty)
+            self.last_loss_stats = {
+                "task_loss": task_loss.detach().item(),
+                "cell_graph_budget_loss": budget.detach().item(),
+                "cell_graph_edge_cost": edge_cost.detach().item(),
+                "cell_graph_balance_loss": balance.detach().item(),
+                "cell_graph_expected_node_ratio": expected_node_ratio.detach().item(),
+                "cell_graph_expected_active_cells": expected_active_cells.detach().item(),
+                "cell_graph_dual_penalty": dual_penalty.detach().item(),
+                "cell_graph_dual_value": float(self.config.cell_graph_dual_value),
+                "total_loss": loss.detach().item(),
+            }
+            return logits, loss
 
         if self.config.dynamic_resource:
             logits = self._forward_dynamic_resource_logits(idx, all_logits=targets is not None)

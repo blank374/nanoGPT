@@ -1,0 +1,6 @@
+model,intervention,nll,ppl
+dynamic,learned,4.224839210510254,68.36351053082545
+dynamic,fixed_most_common,4.224386692047119,68.33258177854904
+dynamic,global_request_shuffle,4.224511623382568,68.34111919252949
+dynamic,same_token_shuffle,4.224868297576904,68.36549905373272
+dynamic,same_token_position_shuffle,4.224908351898193,68.36823744223868

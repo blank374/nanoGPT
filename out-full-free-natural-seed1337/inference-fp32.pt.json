@@ -1,0 +1,16 @@
+{
+  "accepted_lossless": true,
+  "input": "D:\\GitHub\\nanoGPT\\out-full-free-natural-seed1337\\ckpt.pt",
+  "output": "D:\\GitHub\\nanoGPT\\out-full-free-natural-seed1337\\inference-fp32.pt",
+  "input_bytes": 13427557,
+  "output_bytes": 4474781,
+  "size_reduction_fraction": 0.6667464528357616,
+  "source_nll": 2.0483837127685547,
+  "export_nll": 2.0483837127685547,
+  "per_token_nll_bitwise_equal": true,
+  "weights_bitwise_equal": true,
+  "node_masks_equal": true,
+  "edge_masks_equal": true,
+  "input_sha256": "e863afda2bf784156e08285b3dcaaba7d3332798deb00e474a7073513cd798bf",
+  "output_sha256": "2bebc39d749f574ffcc5d8e787c8824dc6bf48ed83a288788adccf71277f5e59"
+}

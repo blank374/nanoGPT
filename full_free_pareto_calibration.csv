@@ -1,0 +1,2 @@
+seed,budget,dynamic_ppl,static_ppl,avg_active_cells,avg_active_edges,avg_depth,cell_macs,router_latency_ms,model_latency_ms
+1337,8.0,8.639301753579732,7.956158139581336,7.6435546875,10.29864501953125,3.93634033203125,125232.0,10.5768212890625,144.298720703125

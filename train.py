@@ -18,6 +18,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 
 import os
 import csv
+import json
 import time
 import math
 import pickle
@@ -56,6 +57,45 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# Free-Fan-In Query (isolated from all dynamic depth/width/MLP experiments)
+free_q = False
+free_q_selector = "binary" # "binary" or "sparsemax"
+free_q_source_projection = "identity" # "identity" or "linear"
+free_q_threshold = 0.5
+free_q_temperature = 1.0
+# unified Dynamic Cell Graph (standalone architecture)
+cell_graph = False
+cell_graph_mode = "legacy"
+cell_graph_cells_per_step = 4
+cell_graph_attention_cells = 1
+cell_graph_fixed_attention = False
+cell_graph_fixed_active_cells = 0
+cell_graph_edge_mode = "learned"
+cell_graph_atom_size = 64
+cell_graph_temperature = 1.0
+cell_graph_temperature_final = 0.5
+cell_graph_temperature_anneal_iters = 1000
+cell_graph_node_threshold = 0.5
+cell_graph_edge_threshold = 0.5
+cell_graph_target_node_ratio = 0.5
+cell_graph_budget_weight = 0.1
+cell_graph_edge_cost_weight = 0.01
+cell_graph_balance_weight = 0.01
+cell_graph_router_hidden = 32
+cell_graph_lookback_steps = 3
+cell_graph_input_projection = "identity"
+cell_graph_node_selector = "sparsemax"
+cell_graph_edge_selector = "sparsemax"
+cell_graph_halt = False
+cell_graph_exploration = 0.0
+cell_graph_exploration_final = 0.0
+cell_graph_exploration_anneal_iters = 0
+cell_graph_budget_mode = "none"
+cell_graph_active_cell_budget = 16.0
+cell_graph_dual_lr = 0.01
+cell_graph_dual_init = 0.0
+cell_graph_support_temperature = 0.05
+cell_graph_static_graph_path = ''
 # dynamic fast/slow path transformer
 dynamic_exit = False
 exit_layers = [3, 6, 9]
@@ -278,6 +318,44 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
+                  free_q=free_q,
+                  free_q_selector=free_q_selector,
+                  free_q_source_projection=free_q_source_projection,
+                  free_q_threshold=free_q_threshold,
+                  free_q_temperature=free_q_temperature,
+                  cell_graph=cell_graph,
+                  cell_graph_mode=cell_graph_mode,
+                  cell_graph_cells_per_step=cell_graph_cells_per_step,
+                  cell_graph_attention_cells=cell_graph_attention_cells,
+                  cell_graph_fixed_attention=cell_graph_fixed_attention,
+                  cell_graph_fixed_active_cells=cell_graph_fixed_active_cells,
+                  cell_graph_edge_mode=cell_graph_edge_mode,
+                  cell_graph_atom_size=cell_graph_atom_size,
+                  cell_graph_temperature=cell_graph_temperature,
+                  cell_graph_temperature_final=cell_graph_temperature_final,
+                  cell_graph_temperature_anneal_iters=cell_graph_temperature_anneal_iters,
+                  cell_graph_node_threshold=cell_graph_node_threshold,
+                  cell_graph_edge_threshold=cell_graph_edge_threshold,
+                  cell_graph_target_node_ratio=cell_graph_target_node_ratio,
+                  cell_graph_budget_weight=cell_graph_budget_weight,
+                  cell_graph_edge_cost_weight=cell_graph_edge_cost_weight,
+                  cell_graph_balance_weight=cell_graph_balance_weight,
+                  cell_graph_router_hidden=cell_graph_router_hidden,
+                  cell_graph_lookback_steps=cell_graph_lookback_steps,
+                  cell_graph_input_projection=cell_graph_input_projection,
+                  cell_graph_node_selector=cell_graph_node_selector,
+                  cell_graph_edge_selector=cell_graph_edge_selector,
+                  cell_graph_halt=cell_graph_halt,
+                  cell_graph_exploration=cell_graph_exploration,
+                  cell_graph_exploration_final=cell_graph_exploration_final,
+                  cell_graph_exploration_anneal_iters=cell_graph_exploration_anneal_iters,
+                  cell_graph_budget_mode=cell_graph_budget_mode,
+                  cell_graph_active_cell_budget=cell_graph_active_cell_budget,
+                  cell_graph_dual_lr=cell_graph_dual_lr,
+                  cell_graph_dual_init=cell_graph_dual_init,
+                  cell_graph_dual_value=cell_graph_dual_init,
+                  cell_graph_support_temperature=cell_graph_support_temperature,
+                  cell_graph_static_graph_path=cell_graph_static_graph_path,
                   dynamic_exit=dynamic_exit, exit_layers=exit_layers,
                   confidence_method=confidence_method,
                   confidence_threshold=confidence_threshold,
@@ -416,7 +494,26 @@ elif init_from == 'resume':
         model_args[k] = checkpoint_model_args[k]
     # Older baseline checkpoints will not have these fields; keep the current
     # command-line/default values so they can still be resumed unchanged.
-    for k in ['dynamic_exit', 'exit_layers', 'confidence_method', 'confidence_threshold',
+    for k in ['free_q', 'free_q_selector', 'free_q_source_projection',
+              'free_q_threshold', 'free_q_temperature', 'cell_graph', 'cell_graph_mode',
+              'cell_graph_cells_per_step', 'cell_graph_attention_cells',
+              'cell_graph_fixed_attention', 'cell_graph_fixed_active_cells',
+              'cell_graph_edge_mode',
+              'cell_graph_atom_size', 'cell_graph_temperature',
+              'cell_graph_temperature_final', 'cell_graph_temperature_anneal_iters',
+              'cell_graph_node_threshold', 'cell_graph_edge_threshold',
+              'cell_graph_target_node_ratio', 'cell_graph_budget_weight',
+              'cell_graph_edge_cost_weight', 'cell_graph_balance_weight',
+              'cell_graph_router_hidden', 'cell_graph_lookback_steps',
+              'cell_graph_input_projection', 'cell_graph_node_selector',
+              'cell_graph_edge_selector', 'cell_graph_halt',
+              'cell_graph_exploration', 'cell_graph_exploration_final',
+              'cell_graph_exploration_anneal_iters', 'cell_graph_budget_mode',
+              'cell_graph_active_cell_budget', 'cell_graph_dual_lr',
+              'cell_graph_dual_init', 'cell_graph_dual_value',
+              'cell_graph_support_temperature',
+              'cell_graph_static_graph_path',
+              'dynamic_exit', 'exit_layers', 'confidence_method', 'confidence_threshold',
               'entropy_threshold', 'early_exit_loss_weight', 'use_distillation',
               'distillation_temperature', 'distillation_beta',
               'enable_dynamic_depth', 'enable_dynamic_width', 'dynamic_depth_choices',
@@ -515,6 +612,17 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+if cell_graph and cell_graph_static_graph_path:
+    graph_path = os.path.abspath(cell_graph_static_graph_path)
+    graph_data = np.load(graph_path)
+    static_nodes = torch.from_numpy(graph_data['node_mask']).to(device=device, dtype=torch.float32)
+    static_edges = torch.from_numpy(graph_data['edge_mask']).to(device=device, dtype=torch.float32)
+    model.set_cell_graph_overrides(static_nodes, static_edges)
+    print(
+        f"fixed Full-Free graph loaded from {graph_path}: "
+        f"active_cells={int((static_nodes > 0).sum().item())}, "
+        f"activation_weight_sum={static_nodes.sum().item():.3f}"
+    )
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -570,6 +678,22 @@ def get_dynamic_width_temperature(it):
         return dynamic_width_temperature
     ratio = min(max(it / dynamic_width_temperature_anneal_iters, 0.0), 1.0)
     return dynamic_width_temperature + ratio * (dynamic_width_temperature_final - dynamic_width_temperature)
+
+def get_cell_graph_temperature(it):
+    if not cell_graph or cell_graph_temperature_anneal_iters <= 0:
+        return cell_graph_temperature
+    ratio = min(max(it / cell_graph_temperature_anneal_iters, 0.0), 1.0)
+    return cell_graph_temperature + ratio * (
+        cell_graph_temperature_final - cell_graph_temperature
+    )
+
+def get_cell_graph_exploration(it):
+    if not cell_graph or cell_graph_exploration_anneal_iters <= 0:
+        return cell_graph_exploration
+    ratio = min(max(it / cell_graph_exploration_anneal_iters, 0.0), 1.0)
+    return cell_graph_exploration + ratio * (
+        cell_graph_exploration_final - cell_graph_exploration
+    )
 
 def get_dynamic_depth_temperature(it):
     if not enable_dynamic_depth or dynamic_depth_temperature_anneal_iters <= 0:
@@ -636,6 +760,158 @@ def append_dynamic_resource_history(step, stats, loss_stats):
             writer.writeheader()
         writer.writerow(row)
 
+def append_cell_graph_history(step, stats, train_loss, val_loss):
+    if not master_process or stats is None or cell_graph_mode != "full_free":
+        return
+    path = os.path.join(out_dir, "full_free_graph_history.csv")
+    fields = [
+        "step", "train_loss", "val_loss", "avg_active_cells", "avg_active_edges",
+        "avg_fanin", "avg_soft_fanin", "avg_effective_depth", "step_widths",
+        "graph_entropy", "top1_coverage", "top4_coverage", "top8_coverage",
+        "top16_coverage", "unique_graphs", "node_usage_entropy",
+        "edge_usage_entropy", "dead_cell_ratio", "node_usage_gini",
+        "active_cell_macs", "skipped_cell_macs", "router_parameters",
+        "router_macs_per_token", "temperature", "exploration", "dual_value",
+        "router_gradient_norm", "node_score_std", "edge_score_std",
+        "std_active_cells", "min_active_cells", "max_active_cells",
+        "std_depth", "min_depth", "max_depth", "empty_step_fraction",
+    ]
+    row = {
+        "step": step, "train_loss": float(train_loss), "val_loss": float(val_loss),
+        "avg_active_cells": stats["mean_active_cells"],
+        "avg_active_edges": stats.get("mean_active_edges", 0.0),
+        "avg_fanin": stats["mean_fanin"],
+        "avg_soft_fanin": stats.get("mean_soft_fanin", 0.0),
+        "avg_effective_depth": stats["mean_depth"],
+        "step_widths": json.dumps(stats["step_widths"]),
+        "graph_entropy": stats.get("edge_graph_entropy", 0.0),
+        "top1_coverage": stats.get("edge_graph_top1_coverage", 1.0),
+        "top4_coverage": stats.get("edge_graph_top4_coverage", 1.0),
+        "top8_coverage": stats.get("edge_graph_top8_coverage", 1.0),
+        "top16_coverage": stats.get("edge_graph_top16_coverage", 1.0),
+        "unique_graphs": stats.get("edge_graph_unique", 1),
+        "node_usage_entropy": stats.get("node_usage_entropy", 0.0),
+        "edge_usage_entropy": stats.get("edge_usage_entropy", 0.0),
+        "dead_cell_ratio": stats.get("dead_cell_ratio", 0.0),
+        "node_usage_gini": stats.get("node_usage_gini", 0.0),
+        "active_cell_macs": stats.get("theoretical_active_cell_macs", 0.0),
+        "skipped_cell_macs": stats.get("theoretical_skipped_cell_macs", 0.0),
+        "router_parameters": stats.get("router_parameters", 0),
+        "router_macs_per_token": stats.get("router_theoretical_macs_per_token", 0),
+        "temperature": raw_model.config.cell_graph_temperature,
+        "exploration": getattr(raw_model.cell_graph, "exploration", 0.0),
+        "dual_value": stats.get("dual_value", 0.0),
+        "router_gradient_norm": router_gradient_norm,
+        "node_score_std": stats.get("node_score_std", 0.0),
+        "edge_score_std": stats.get("edge_score_std", 0.0),
+        "std_active_cells": stats.get("std_active_cells", 0.0),
+        "min_active_cells": stats.get("min_active_cells", 0.0),
+        "max_active_cells": stats.get("max_active_cells", 0.0),
+        "std_depth": stats.get("std_depth", 0.0),
+        "min_depth": stats.get("min_depth", 0.0),
+        "max_depth": stats.get("max_depth", 0.0),
+        "empty_step_fraction": stats.get("empty_step_fraction", 0.0),
+    }
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+def append_free_q_history(step, stats, train_loss, val_loss):
+    if not master_process or stats is None:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    summary_path = os.path.join(out_dir, "free_q_history.csv")
+    summary_fields = [
+        "step", "train_loss", "val_ppl", "avg_q_fanin",
+        "fanin_1_ratio", "fanin_2_ratio", "fanin_3_ratio", "fanin_4_ratio",
+        "source_current_usage", "source_previous_usage",
+        "source_earlier_usage", "source_anchor_usage",
+        "q_mask_entropy", "conditional_q_mask_entropy_token",
+        "unique_q_masks", "top1_q_mask_coverage", "top4_q_mask_coverage",
+    ]
+    summary_row = {
+        "step": step,
+        "train_loss": float(train_loss),
+        "val_ppl": math.exp(min(float(val_loss), 20.0)),
+        "avg_q_fanin": stats["average_hard_fanin"],
+        **{f"fanin_{k}_ratio": stats["fanin_distribution"][str(k)] for k in range(1, 5)},
+        **{f"source_{name}_usage": stats["source_usage"][name]
+           for name in stats["source_names"]},
+        "q_mask_entropy": stats["mask_entropy"],
+        "conditional_q_mask_entropy_token": stats.get("conditional_mask_entropy_token", ""),
+        "unique_q_masks": stats["unique_masks"],
+        "top1_q_mask_coverage": stats["top1_mask_coverage"],
+        "top4_q_mask_coverage": stats["top4_mask_coverage"],
+    }
+    exists = os.path.exists(summary_path)
+    with open(summary_path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=summary_fields)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(summary_row)
+
+    head_path = os.path.join(out_dir, "free_q_heads_history.csv")
+    head_fields = [
+        "step", "layer", "head", "avg_q_fanin", "mask_entropy",
+        "conditional_mask_entropy_token", "unique_masks", "top1_coverage", "top4_coverage",
+        *[f"fanin_{k}_ratio" for k in range(1, 5)],
+        *[f"{kind}_{name}" for kind in ("usage", "probability")
+          for name in stats["source_names"]],
+    ]
+    exists = os.path.exists(head_path)
+    with open(head_path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=head_fields)
+        if not exists:
+            writer.writeheader()
+        for layer in stats["layers"]:
+            for head in layer["heads"]:
+                writer.writerow({
+                    "step": step, "layer": head["layer"], "head": head["head"],
+                    "avg_q_fanin": head["average_hard_fanin"],
+                    "mask_entropy": head["mask_entropy"],
+                    "conditional_mask_entropy_token": head.get("conditional_mask_entropy_token", ""),
+                    "unique_masks": head["unique_masks"],
+                    "top1_coverage": head["top1_mask_coverage"],
+                    "top4_coverage": head["top4_mask_coverage"],
+                    **{f"fanin_{k}_ratio": head["fanin_distribution"][str(k)] for k in range(1, 5)},
+                    **{f"usage_{name}": head["source_usage"][name] for name in stats["source_names"]},
+                    **{f"probability_{name}": head["source_probability"][name] for name in stats["source_names"]},
+                })
+
+    layer_path = os.path.join(out_dir, "free_q_layers_history.csv")
+    layer_fields = [
+        "step", "layer", "avg_q_fanin", "mean_head_mask_entropy",
+        *[f"fanin_{k}_ratio" for k in range(1, 5)],
+        *[f"{kind}_{name}" for kind in ("usage", "probability")
+          for name in stats["source_names"]],
+    ]
+    exists = os.path.exists(layer_path)
+    with open(layer_path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=layer_fields)
+        if not exists:
+            writer.writeheader()
+        for layer in stats["layers"]:
+            heads = layer["heads"]
+            mean = lambda values: sum(values) / len(values)
+            writer.writerow({
+                "step": step,
+                "layer": layer["layer"],
+                "avg_q_fanin": mean([head["average_hard_fanin"] for head in heads]),
+                "mean_head_mask_entropy": mean([head["mask_entropy"] for head in heads]),
+                **{f"fanin_{k}_ratio": mean([
+                    head["fanin_distribution"][str(k)] for head in heads
+                ]) for k in range(1, 5)},
+                **{f"usage_{name}": mean([
+                    head["source_usage"][name] for head in heads
+                ]) for name in stats["source_names"]},
+                **{f"probability_{name}": mean([
+                    head["source_probability"][name] for head in heads
+                ]) for name in stats["source_names"]},
+            })
+
 def get_free_channel_temperature(it):
     if not free_channel_mlp or free_channel_temperature_anneal_iters <= 0:
         return free_channel_temperature
@@ -677,12 +953,16 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+router_gradient_norm = 0.0
 while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+    if cell_graph:
+        raw_model.set_cell_graph_temperature(get_cell_graph_temperature(iter_num))
+        raw_model.set_cell_graph_exploration(get_cell_graph_exploration(iter_num))
     if enable_dynamic_depth:
         raw_model.set_dynamic_depth_temperature(get_dynamic_depth_temperature(iter_num))
         raw_model.set_dynamic_depth_compute_weight(get_dynamic_depth_compute_weight(iter_num))
@@ -708,6 +988,56 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        graph_stats = raw_model.last_cell_graph_stats
+        if graph_stats is not None:
+            widths = ", ".join(
+                f"S{step}={width:.2f}"
+                for step, width in enumerate(graph_stats["step_widths"])
+            )
+            print(
+                f"  eval_cell_graph: active {graph_stats['mean_active_cells']:.2f}/"
+                f"{graph_stats['num_cells']}, width {graph_stats['mean_width']:.2f}, "
+                f"depth {graph_stats['mean_depth']:.2f}, fanin {graph_stats['mean_fanin']:.2f}, "
+                f"unique {graph_stats['unique_node_graphs']}, {widths}"
+            )
+            if "edge_graph_entropy" in graph_stats:
+                print(
+                    f"    edge_graph: H={graph_stats['edge_graph_entropy']:.4f}, "
+                    f"top1/4/8={graph_stats['edge_graph_top1_coverage']:.3f}/"
+                    f"{graph_stats['edge_graph_top4_coverage']:.3f}/"
+                    f"{graph_stats['edge_graph_top8_coverage']:.3f}, "
+                    f"unique={graph_stats['edge_graph_unique']}"
+                )
+            if cell_graph_mode == "full_free":
+                print(
+                    f"    full_free: edges={graph_stats.get('mean_active_edges', 0.0):.2f}, "
+                    f"path={graph_stats.get('average_path_length', 0.0):.2f}, "
+                    f"dead={graph_stats.get('dead_cell_ratio', 0.0):.3f}, "
+                    f"gini={graph_stats.get('node_usage_gini', 0.0):.3f}, "
+                    f"dual={graph_stats.get('dual_value', 0.0):.4f}"
+                )
+                append_cell_graph_history(
+                    iter_num, graph_stats, losses['train'], losses['val']
+                )
+        free_q_stats = raw_model.last_free_q_stats
+        if free_q_stats is not None:
+            fanin = ", ".join(
+                f"F{k}={free_q_stats['fanin_distribution'][str(k)]:.3f}"
+                for k in range(1, 5)
+            )
+            usage = ", ".join(
+                f"{name}={free_q_stats['source_usage'][name]:.3f}"
+                for name in free_q_stats["source_names"]
+            )
+            print(
+                f"  eval_free_q: mean_fanin {free_q_stats['average_hard_fanin']:.3f}, "
+                f"unique {free_q_stats['unique_masks']}, "
+                f"top1/top4 {free_q_stats['top1_mask_coverage']:.3f}/"
+                f"{free_q_stats['top4_mask_coverage']:.3f}, "
+                f"H(mask) {free_q_stats['mask_entropy']:.4f}, {fanin}"
+            )
+            print(f"    source_usage: {usage}")
+            append_free_q_history(iter_num, free_q_stats, losses['train'], losses['val'])
         depth_stats = raw_model.last_dynamic_depth_stats
         if depth_stats is not None:
             depth_dist = ", ".join(
@@ -842,6 +1172,17 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
+            if graph_stats is not None:
+                wandb_metrics.update({
+                    "cell_graph/active_cells": graph_stats["mean_active_cells"],
+                    "cell_graph/active_ratio": graph_stats["mean_active_ratio"],
+                    "cell_graph/width": graph_stats["mean_width"],
+                    "cell_graph/depth": graph_stats["mean_depth"],
+                    "cell_graph/fanin": graph_stats["mean_fanin"],
+                    "cell_graph/unique_node_graphs": graph_stats["unique_node_graphs"],
+                    "cell_graph/node_usage_std": graph_stats["node_usage_std"],
+                    "cell_graph/temperature": raw_model.config.cell_graph_temperature,
+                })
             if depth_stats is not None:
                 wandb_metrics.update({
                     "dynamic_depth/mean_depth": depth_stats["mean_depth"],
@@ -942,6 +1283,12 @@ while True:
             if iter_num > 0:
                 if enable_dynamic_depth:
                     model_args['dynamic_depth_temperature'] = raw_model.config.dynamic_depth_temperature
+                if cell_graph:
+                    model_args['cell_graph_temperature'] = raw_model.config.cell_graph_temperature
+                    model_args['cell_graph_exploration'] = getattr(
+                        raw_model.cell_graph, 'exploration', cell_graph_exploration
+                    )
+                    model_args['cell_graph_dual_value'] = raw_model.config.cell_graph_dual_value
                 if dynamic_resource:
                     model_args['dynamic_resource_temperature'] = raw_model.config.dynamic_resource_temperature
                 if dynamic_width:
@@ -991,9 +1338,18 @@ while True:
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    if cell_graph and cell_graph_mode == "full_free":
+        squared_router_grad = sum(
+            parameter.grad.detach().float().pow(2).sum().item()
+            for parameter in raw_model.cell_graph.router.parameters()
+            if parameter.grad is not None
+        )
+        router_gradient_norm = math.sqrt(squared_router_grad)
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
+    if cell_graph and cell_graph_budget_mode == "dual_active_cells":
+        raw_model.update_cell_graph_dual()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -1009,6 +1365,31 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        graph_stats = raw_model.last_cell_graph_stats
+        if graph_stats is not None:
+            loss_stats = raw_model.last_loss_stats or {}
+            print(
+                f"  cell_graph: active {graph_stats['mean_active_cells']:.2f}/"
+                f"{graph_stats['num_cells']}, width {graph_stats['mean_width']:.2f}, "
+                f"depth {graph_stats['mean_depth']:.2f}, fanin {graph_stats['mean_fanin']:.2f}, "
+                f"unique {graph_stats['unique_node_graphs']}"
+            )
+            print(
+                f"  graph_losses: task={loss_stats.get('task_loss', 0.0):.4f}, "
+                f"budget={loss_stats.get('cell_graph_budget_loss', 0.0):.5f}, "
+                f"edges={loss_stats.get('cell_graph_edge_cost', 0.0):.4f}, "
+                f"balance={loss_stats.get('cell_graph_balance_loss', 0.0):.5f}, "
+                f"expected_nodes={loss_stats.get('cell_graph_expected_node_ratio', 0.0):.3f}"
+            )
+            if cell_graph_mode == "full_free":
+                print(
+                    f"    full_free: edges={graph_stats.get('mean_active_edges', 0.0):.2f}, "
+                    f"step_widths={','.join(f'{w:.2f}' for w in graph_stats['step_widths'])}, "
+                    f"graph_H={graph_stats.get('edge_graph_entropy', 0.0):.3f}, "
+                    f"dead={graph_stats.get('dead_cell_ratio', 0.0):.3f}, "
+                    f"dual={raw_model.config.cell_graph_dual_value:.4f}, "
+                    f"router_grad={router_gradient_norm:.3e}"
+                )
         depth_stats = raw_model.last_dynamic_depth_stats
         if depth_stats is not None:
             loss_stats = raw_model.last_loss_stats or {}

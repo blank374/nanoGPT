@@ -1,0 +1,31 @@
+{
+  "architecture": "full-free-attention-v2",
+  "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-smoke\\ckpt.pt",
+  "checkpoint_iter": 50,
+  "device": "cuda",
+  "dtype": "float16",
+  "batch_size": 16,
+  "block_size": 128,
+  "mean_nll": 2.860952854156494,
+  "ppl": 17.47817315454977,
+  "mean_active_cells": 32.0,
+  "mean_active_attention_steps": 8.0,
+  "mean_active_attention_ratio": 1.0,
+  "mean_physically_executed_attention_steps_per_batch": 8.0,
+  "attention_step_usage": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "mandatory_attention_steps": [
+    0,
+    4,
+    7
+  ],
+  "dynamic_latency_ms": 238.044189453125
+}

@@ -1,0 +1,21 @@
+digraph G {
+  current [shape=box];
+  C3 [label="S0C3"];
+  current -> C3;
+  C4 [label="S1C0"];
+  C3 -> C4;
+  C9 [label="S2C1"];
+  C4 -> C9;
+  C15 [label="S3C3"];
+  C4 -> C15;
+  C18 [label="S4C2"];
+  C4 -> C18;
+  C20 [label="S5C0"];
+  C15 -> C20;
+  C24 [label="S6C0"];
+  C15 -> C24;
+  C26 [label="S6C2"];
+  C15 -> C26;
+  C30 [label="S7C2"];
+  C20 -> C30;
+}

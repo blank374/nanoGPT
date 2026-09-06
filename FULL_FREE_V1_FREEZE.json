@@ -1,0 +1,33 @@
+{
+  "name": "full-free-cell-graph-v1",
+  "frozen_at": "2026-09-04",
+  "architecture": {
+    "steps": 8,
+    "cells_per_step": 4,
+    "embedding": 128,
+    "cell_hidden": 64,
+    "router_hidden": 32,
+    "lookback_steps": 3,
+    "node_selector": "sparsemax",
+    "edge_selector": "sparsemax",
+    "input_projection": "identity",
+    "attention": "fixed_standard_causal_per_step",
+    "halt": false,
+    "free_q": false,
+    "balance_loss": 0.0
+  },
+  "natural_protocol": {
+    "max_iters": 1000,
+    "seeds": [1337, 2027, 3407],
+    "node_cost": 0.0,
+    "edge_cost": 0.0,
+    "depth_cost": 0.0,
+    "exploration": 0.0
+  },
+  "sha256": {
+    "model.py": "22F668912EB25F62528ABB167BF505F74603088120DB41D78295D710F61AE94A",
+    "train.py": "CAC8DB57DBA6DD995D1FA2EF5E44D314A90DB40A2291C0AF00244D58944E081C",
+    "config/train_shakespeare_char_full_free_common.py": "E5356865BA81305897A7A7F02C902159911F42837E8AFCE6D4AEADA87305E56C",
+    "experiments/full_free_cell_graph_analysis.py": "9594F80F1B51B108C73A721BBA8B7BC56C5A402050A626C1AEDC0DCA9D7A305D"
+  }
+}

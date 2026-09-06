@@ -1,0 +1,6 @@
+difficulty_quintile,tokens,avg_active_cells,avg_active_edges,avg_fanin,avg_depth,graph_entropy
+1,13,32.0,320.0,10.0,8.0,-0.0
+2,13,32.0,320.0,10.0,8.0,-0.0
+3,12,32.0,320.0,10.0,8.0,-0.0
+4,13,32.0,320.0,10.0,8.0,-0.0
+5,13,32.0,320.0,10.0,8.0,-0.0

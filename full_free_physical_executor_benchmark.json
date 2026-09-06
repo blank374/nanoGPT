@@ -1,0 +1,78 @@
+[
+  {
+    "out_dir": "out-full-free-natural-seed1337",
+    "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-natural-seed1337\\ckpt.pt",
+    "device": "cuda",
+    "amp_dtype": "float32",
+    "batch_size": 8,
+    "block_size": 128,
+    "dense_latency_ms": 367.300732421875,
+    "sparse_latency_ms": 338.807421875,
+    "speedup_x": 1.0840988381812586,
+    "latency_reduction_fraction": 0.07757488083129693,
+    "dense_samples_ms": [
+      368.531884765625,
+      354.46455078125,
+      367.300732421875
+    ],
+    "sparse_samples_ms": [
+      400.589208984375,
+      338.807421875,
+      338.524169921875
+    ],
+    "dense_nll": 2.124720335006714,
+    "sparse_nll": 2.124720335006714,
+    "nll_abs_diff": 0.0,
+    "logits_max_abs_diff": 6.9141387939453125e-06,
+    "logits_mean_abs_diff": 4.2666388821999135e-07,
+    "node_masks_equal": true,
+    "edge_masks_equal": true,
+    "semantic_check_passed": true,
+    "active_token_cell_pairs": 23239,
+    "possible_token_cell_pairs": 32768,
+    "active_pair_ratio": 0.709197998046875,
+    "nonempty_cell_queues": 32,
+    "empty_cell_queues": 0,
+    "min_nonempty_queue": 346,
+    "mean_nonempty_queue": 726.21875,
+    "max_nonempty_queue": 1024
+  },
+  {
+    "out_dir": "out-full-free-budget8-seed1337",
+    "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-budget8-seed1337\\ckpt.pt",
+    "device": "cuda",
+    "amp_dtype": "float32",
+    "batch_size": 8,
+    "block_size": 128,
+    "dense_latency_ms": 326.86005859375,
+    "sparse_latency_ms": 339.1324462890625,
+    "speedup_x": 0.9638124047710492,
+    "latency_reduction_fraction": -0.037546305743540564,
+    "dense_samples_ms": [
+      326.86005859375,
+      328.3766357421875,
+      321.90380859375
+    ],
+    "sparse_samples_ms": [
+      347.4954345703125,
+      339.1324462890625,
+      334.49521484375
+    ],
+    "dense_nll": 2.2406702041625977,
+    "sparse_nll": 2.2406702041625977,
+    "nll_abs_diff": 0.0,
+    "logits_max_abs_diff": 6.556510925292969e-06,
+    "logits_mean_abs_diff": 4.239843462983117e-07,
+    "node_masks_equal": true,
+    "edge_masks_equal": true,
+    "semantic_check_passed": true,
+    "active_token_cell_pairs": 7868,
+    "possible_token_cell_pairs": 32768,
+    "active_pair_ratio": 0.2401123046875,
+    "nonempty_cell_queues": 24,
+    "empty_cell_queues": 8,
+    "min_nonempty_queue": 2,
+    "mean_nonempty_queue": 327.8333333333333,
+    "max_nonempty_queue": 946
+  }
+]

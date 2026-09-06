@@ -1,0 +1,45 @@
+[
+  {
+    "out_dir": "out-full-free-budget8-seed1337",
+    "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-budget8-seed1337\\inference-fp32.pt",
+    "device": "cuda",
+    "amp_dtype": "float16",
+    "executor_mode": "token_queue",
+    "batch_size": 128,
+    "block_size": 128,
+    "dense_latency_ms": 666.4962890625,
+    "sparse_latency_ms": 628.925048828125,
+    "speedup_x": 1.0597388199188145,
+    "latency_reduction_fraction": 0.05637126695367356,
+    "dense_samples_ms": [
+      681.64951171875,
+      645.575146484375,
+      645.431591796875,
+      666.4962890625,
+      683.8056640625
+    ],
+    "sparse_samples_ms": [
+      643.959228515625,
+      628.925048828125,
+      617.54111328125,
+      619.2451171875,
+      644.931298828125
+    ],
+    "dense_nll": 2.1563687324523926,
+    "sparse_nll": 2.1563687324523926,
+    "nll_abs_diff": 0.0,
+    "logits_max_abs_diff": 0.0,
+    "logits_mean_abs_diff": 0.0,
+    "node_masks_equal": true,
+    "edge_masks_equal": true,
+    "semantic_check_passed": true,
+    "active_token_cell_pairs": 125245,
+    "possible_token_cell_pairs": 524288,
+    "active_pair_ratio": 0.23888587951660156,
+    "nonempty_cell_queues": 24,
+    "empty_cell_queues": 8,
+    "min_nonempty_queue": 75,
+    "mean_nonempty_queue": 5218.541666666667,
+    "max_nonempty_queue": 15270
+  }
+]

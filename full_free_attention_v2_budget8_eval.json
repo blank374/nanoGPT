@@ -1,0 +1,53 @@
+{
+  "architecture": "full-free-attention-v2",
+  "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-budget8-seed1337\\ckpt.pt",
+  "checkpoint_iter": 1000,
+  "device": "cuda",
+  "dtype": "float16",
+  "batch_size": 16,
+  "block_size": 128,
+  "mean_nll": 2.1512192249298097,
+  "ppl": 8.595331653885072,
+  "mean_active_cells": 5.371240234375,
+  "mean_active_attention_steps": 3.00703125,
+  "mean_active_attention_ratio": 0.37587890625,
+  "mean_physically_executed_attention_steps_per_batch": 7.1,
+  "attention_step_usage": [
+    1.0,
+    0.0019042969215661287,
+    0.001953125,
+    4.882812572759576e-05,
+    1.0,
+    0.0015625000232830644,
+    0.0015625000232830644,
+    1.0
+  ],
+  "mandatory_attention_steps": [
+    0,
+    4,
+    7
+  ],
+  "dense_masked_latency_ms": 85.045166015625,
+  "physical_skip_latency_ms": 81.492216796875,
+  "physical_speedup_x": 1.0435986325860538,
+  "physical_latency_reduction_fraction": 0.04177720363432802,
+  "physical_vs_dense_logits_max_abs_diff": 0.0,
+  "physical_vs_dense_attention_masks_equal": true,
+  "condense_threshold": 0.01,
+  "condensed_attention_plan": [
+    0,
+    4,
+    7
+  ],
+  "condensed_attention_steps": 3,
+  "condensed_nll": 2.1524628162384034,
+  "condensed_ppl": 8.606027382803656,
+  "condensed_nll_delta": 0.00124359130859375,
+  "condensed_latency_ms": 77.482509765625,
+  "condensed_vs_dense_speedup_x": 1.0976046887597743,
+  "condensed_vs_dense_latency_reduction_fraction": 0.08892517475491257,
+  "condensed_cell_queue_latency_ms": 81.990322265625,
+  "condensed_cell_queue_vs_dense_speedup_x": 1.0372585893747703,
+  "condensed_cell_queue_vs_dense_latency_reduction_fraction": 0.03592025147483102,
+  "condensed_cell_queue_logits_max_abs_diff": 0.0
+}

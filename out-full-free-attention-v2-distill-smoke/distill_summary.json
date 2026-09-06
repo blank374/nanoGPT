@@ -1,0 +1,33 @@
+{
+  "student_source": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-budget8-seed1337/ckpt.pt",
+  "teacher_source": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-budget72-quality-seed1337/ckpt.pt",
+  "fast_attention_plan": [
+    0,
+    4,
+    7
+  ],
+  "history": [
+    {
+      "nll": 2.064859628677368,
+      "ppl": 7.884191105642408,
+      "active_cells": 5.47265625,
+      "active_attention": 3.0,
+      "iteration": 0
+    },
+    {
+      "nll": 2.189141035079956,
+      "ppl": 8.927541375429257,
+      "active_cells": 5.45703125,
+      "active_attention": 3.0,
+      "iteration": 1
+    },
+    {
+      "nll": 2.1412699222564697,
+      "ppl": 8.51023811033291,
+      "active_cells": 5.365234375,
+      "active_attention": 3.0,
+      "iteration": 2
+    }
+  ],
+  "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-distill-smoke\\ckpt.pt"
+}

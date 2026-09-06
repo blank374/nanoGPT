@@ -1,0 +1,14 @@
+{
+  "unique": 577,
+  "entropy": 4.676170718083927,
+  "top1_coverage": 0.05108642578125,
+  "top4_coverage": 0.188720703125,
+  "top8_coverage": 0.31109619140625,
+  "conditional_entropy_token": 1.4165377101072631,
+  "mask_token_mutual_information": 3.259633007976664,
+  "learned_ppl": 7.539961275577511,
+  "fixed_most_common_ppl": 8.776047430931989,
+  "shuffled_ppl": 9.463611795927775,
+  "learned_beats_fixed_most_common": true,
+  "learned_beats_shuffle": true
+}

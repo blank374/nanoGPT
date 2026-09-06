@@ -1,0 +1,46 @@
+[
+  {
+    "out_dir": "out-full-free-budget8-seed1337",
+    "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-budget8-seed1337\\ckpt.pt",
+    "device": "cpu",
+    "amp_dtype": "float32",
+    "executor_mode": "token_queue",
+    "batch_size": 8,
+    "block_size": 128,
+    "dense_latency_ms": 246.40142000025662,
+    "sparse_latency_ms": 242.6532200002839,
+    "speedup_x": 1.0154467350565894,
+    "latency_reduction_fraction": 0.015211762984031485,
+    "dense_samples_ms": [
+      245.7042599999113,
+      251.67113999996218,
+      247.42086000005656,
+      246.40142000025662,
+      244.25170000031358
+    ],
+    "sparse_samples_ms": [
+      241.08985999992,
+      243.6794999997801,
+      249.91160000026866,
+      241.5190399999119,
+      242.6532200002839
+    ],
+    "dense_nll": 2.2406697273254395,
+    "sparse_nll": 2.2406697273254395,
+    "nll_abs_diff": 0.0,
+    "logits_max_abs_diff": 4.76837158203125e-07,
+    "logits_mean_abs_diff": 1.5791626339911602e-10,
+    "node_masks_equal": true,
+    "edge_masks_equal": true,
+    "semantic_check_passed": true,
+    "executor_selected": "token_queue",
+    "active_token_cell_pairs": 7868,
+    "possible_token_cell_pairs": 32768,
+    "active_pair_ratio": 0.2401123046875,
+    "nonempty_cell_queues": 24,
+    "empty_cell_queues": 8,
+    "min_nonempty_queue": 2,
+    "mean_nonempty_queue": 327.8333333333333,
+    "max_nonempty_queue": 946
+  }
+]

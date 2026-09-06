@@ -1,0 +1,17 @@
+{
+  "seed": 1337,
+  "samples": 512,
+  "mean_active_cells": 22.490234375,
+  "mean_nll_full": 2.210179811820126,
+  "mean_nll_keep80": 2.2817959729072754,
+  "mean_nll_keep60": 2.5960710960753204,
+  "mean_nll_keep40": 3.298272988469762,
+  "mean_marginal_last20": 0.07161616108714952,
+  "mean_marginal_last4": 0.06249234825372696,
+  "pearson_active_vs_marginal_last20": 0.011915870823894305,
+  "spearman_active_vs_marginal_last20": -0.01104296715441359,
+  "pearson_active_vs_marginal_last4": 0.011517453255088397,
+  "spearman_active_vs_marginal_last4": 0.03576180970952334,
+  "pearson_active_vs_utility_full_to40": 0.25965803193580006,
+  "spearman_active_vs_utility_full_to40": 0.2044921122655562
+}
