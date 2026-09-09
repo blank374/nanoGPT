@@ -1,0 +1,113 @@
+{
+  "checkpoint": "out-cpu-potential-validation/ckpt_iter_100.pt",
+  "step": 100,
+  "device": "cpu",
+  "samples": 16,
+  "block_size": 64,
+  "seed": 1337,
+  "calibration_latency_ms": [
+    0.7814579998921545,
+    0.8957919999375008,
+    0.9652080002524599,
+    0.9529579997433757,
+    0.9975829998438712
+  ],
+  "cost_profile_ms_per_layer": [
+    0.0,
+    0.028583500011336582,
+    0.045937500090076355,
+    0.042874999962805305,
+    0.054031249987929186
+  ],
+  "cost_monotonic_nonincreasing": true,
+  "route_repeat_stability_min": 1.0,
+  "input_conditioned_cost": false,
+  "feasible_lambda_count": 3,
+  "pareto_lambda_count": 3,
+  "rows": [
+    {
+      "lambda": 0.0,
+      "loss": 2.5367491543293,
+      "reference_loss": 2.5372339636087418,
+      "quality_gap": -0.0004848092794418335,
+      "feasible_fraction": 1.0,
+      "quality_tolerance": 0.02,
+      "latency_ms": 0.9917864375381669,
+      "cost": 0.2161249965429306,
+      "loss_std": 0.13602205481998053,
+      "latency_std": 0.04909244361106106,
+      "cost_std": 0.0,
+      "unique_paths": 1
+    },
+    {
+      "lambda": 25.0,
+      "loss": 2.533972382545471,
+      "reference_loss": 2.5372339636087418,
+      "quality_gap": -0.003261581063270569,
+      "feasible_fraction": 1.0,
+      "quality_tolerance": 0.02,
+      "latency_ms": 0.9979244375131202,
+      "cost": 0.2161249965429306,
+      "loss_std": 0.13664696017708292,
+      "latency_std": 0.04641196323693025,
+      "cost_std": 0.0,
+      "unique_paths": 1
+    },
+    {
+      "lambda": 50.0,
+      "loss": 2.5456175357103348,
+      "reference_loss": 2.5372339636087418,
+      "quality_gap": 0.008383572101593018,
+      "feasible_fraction": 0.9375,
+      "quality_tolerance": 0.02,
+      "latency_ms": 0.9837996249757452,
+      "cost": 0.2161249965429306,
+      "loss_std": 0.14224149797297306,
+      "latency_std": 0.06464256204621377,
+      "cost_std": 0.0,
+      "unique_paths": 1
+    },
+    {
+      "lambda": 75.0,
+      "loss": 2.7064765244722366,
+      "reference_loss": 2.5372339636087418,
+      "quality_gap": 0.16924256086349487,
+      "feasible_fraction": 0.875,
+      "quality_tolerance": 0.02,
+      "latency_ms": 0.9927316875177894,
+      "cost": 0.2161249965429306,
+      "loss_std": 0.43583850180832506,
+      "latency_std": 0.03858840113193405,
+      "cost_std": 0.0,
+      "unique_paths": 1
+    },
+    {
+      "lambda": 100.0,
+      "loss": 2.8926079273223877,
+      "reference_loss": 2.5372339636087418,
+      "quality_gap": 0.35537396371364594,
+      "feasible_fraction": 0.3125,
+      "quality_tolerance": 0.02,
+      "latency_ms": 0.9899376249506986,
+      "cost": 0.2161249965429306,
+      "loss_std": 0.5683516347766089,
+      "latency_std": 0.042671100464002444,
+      "cost_std": 0.0,
+      "unique_paths": 1
+    },
+    {
+      "lambda": 150.0,
+      "loss": 3.830540657043457,
+      "reference_loss": 2.5372339636087418,
+      "quality_gap": 1.2933066934347153,
+      "feasible_fraction": 0.0,
+      "quality_tolerance": 0.02,
+      "latency_ms": 1.0372890624523734,
+      "cost": 0.2161249965429306,
+      "loss_std": 0.2551100988754723,
+      "latency_std": 0.11275971131795592,
+      "cost_std": 0.0,
+      "unique_paths": 1
+    }
+  ]
+}

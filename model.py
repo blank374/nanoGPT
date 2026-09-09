@@ -1241,6 +1241,18 @@ class GPTConfig:
     dynamic_resource_full_ce_weight: float = 0.5
     dynamic_resource_collapse_threshold: float = 0.95
     dynamic_resource_eval_impl: str = "physical" # "research" or "physical"
+    # Shared computational-potential controls.  Costs are expressed in one
+    # hardware currency (normally normalized microseconds); individual
+    # routing mechanisms may map their actions into this profile.
+    computational_potential_enabled: bool = False
+    computational_potential_lambda: float = 0.0
+    computational_potential_cost_profile: list = None
+    computational_potential_fixed_cost: float = 0.0
+    computational_potential_group_cost: float = 0.0
+    computational_potential_quality_tolerance: float = 0.02
+    computational_potential_quality_penalty: float = 5.0
+    computational_potential_utility_weight: float = 0.0
+    computational_potential_utility_scale: float = 0.05
     dynamic_mlp: bool = False
     dynamic_mlp_fast_ratio: float = 1.0
     dynamic_mlp_slow_ratio: float = 3.0
@@ -2647,6 +2659,16 @@ class GPT(nn.Module):
             return logits, probs, modes, weights
 
         modes = probs.argmax(dim=-1)
+        if (self.config.computational_potential_enabled
+                and self.config.computational_potential_lambda != 0.0):
+            costs = self._computational_potential_costs(
+                len(self.config.dynamic_resource_widths), x.device, logits.dtype
+            )
+            # This is the deploy-time operating-point control.  The router
+            # still proposes actions; lambda prices them in the same units as
+            # the router score, so one checkpoint can expose multiple modes.
+            priced_logits = logits - self.config.computational_potential_lambda * costs
+            modes = priced_logits.argmax(dim=-1)
         hard = F.one_hot(modes, probs.size(-1)).to(probs.dtype)
         routing = self.config.dynamic_resource_routing
         if not self.training or routing == "ste":
@@ -2660,12 +2682,94 @@ class GPT(nn.Module):
             weights = probs
         return logits, probs, modes, weights
 
+    def _computational_potential_costs(self, count, device, dtype):
+        """Return the shared cost currency for one router's actions.
+
+        The default is the old width/FLOPs proxy, preserving old checkpoints.
+        A measured profile can instead contain one value per action, e.g.
+        [0.35, 0.62, 0.91, 1.44, 2.30] milliseconds.  The values need not be
+        linear in width; that non-linearity is the point of calibration.
+        """
+        profile = self.config.computational_potential_cost_profile
+        if profile is None:
+            if count == 5:
+                profile = [0.0, 0.125, 0.25, 0.50, 1.0]
+            else:
+                profile = [float(i) / max(count - 1, 1) for i in range(count)]
+        if len(profile) != count:
+            raise ValueError(
+                "computational_potential_cost_profile must have one value "
+                f"per route action ({count}), got {len(profile)}"
+            )
+        return torch.as_tensor(profile, device=device, dtype=dtype)
+
+    def _computational_potential_cost(self, probs, modes):
+        """Expected and hard batch execution cost in the shared currency."""
+        costs = self._computational_potential_costs(
+            probs.size(-1), probs.device, probs.dtype
+        )
+        expected = (probs * costs).sum(dim=-1).sum(dim=-1).mean()
+        hard = costs[modes].sum(dim=-1).mean()
+        active_prob = 1.0 - probs[..., 0]
+        expected = expected + self.config.computational_potential_fixed_cost * active_prob.sum(dim=-1).mean()
+        active = modes != 0
+        hard = hard + self.config.computational_potential_fixed_cost * active.sum(dim=-1).float().mean()
+        group_cost = self.config.computational_potential_group_cost
+        if group_cost:
+            # Probability that an action appears at least once in this batch.
+            presence = 1.0 - (1.0 - probs.clamp(0.0, 1.0)).pow(probs.size(0))
+            expected = expected + group_cost * presence[..., 1:].sum(dim=-1).mean()
+            hard_groups = torch.stack([
+                torch.unique(modes[:, layer]).numel() - int((modes[:, layer] == 0).all())
+                for layer in range(modes.size(1))
+            ]).to(probs.dtype).mean()
+            hard = hard + group_cost * hard_groups
+        return expected, hard, costs
+
+    def _dynamic_resource_utility_loss(self, idx, probs, full_logits, targets):
+        """Distill per-input counterfactual value into the resource router.
+
+        Utility is measured by removing one layer from the full path at a
+        time.  This is deliberately a training-time teacher signal; inference
+        does not run these counterfactual paths.
+        """
+        if self.config.computational_potential_utility_weight == 0.0:
+            return None, None, None
+        valid = targets != -1
+        batch = targets.size(0)
+
+        def per_example_ce(logits):
+            values = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
+                reduction="none", ignore_index=-1
+            ).view(batch, -1)
+            mask = valid.view(batch, -1)
+            return (values * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1)
+
+        full_per_example = per_example_ce(full_logits).detach()
+        full_path = [self.config.dynamic_resource_widths[-1]] * self.config.n_layer
+        utilities = []
+        for layer in range(self.config.n_layer):
+            ablated_path = list(full_path)
+            ablated_path[layer] = self.config.dynamic_resource_widths[0]
+            ablated_logits = self._forward_dynamic_resource_logits(
+                idx,
+                forced_path=ablated_path, record_stats=False, all_logits=True
+            )
+            utilities.append(per_example_ce(ablated_logits) - full_per_example)
+        utility = torch.stack(utilities, dim=1)
+        target_active = torch.sigmoid(
+            (utility - self.config.computational_potential_quality_tolerance)
+            / max(self.config.computational_potential_utility_scale, 1e-6)
+        )
+        predicted_active = 1.0 - probs[..., 0]
+        utility_loss = F.mse_loss(predicted_active, target_active)
+        return utility_loss, utility.detach(), target_active.detach()
+
     def _set_dynamic_resource_stats(self, probs, modes):
         widths = torch.tensor(self.config.dynamic_resource_widths, device=modes.device)
         selected_widths = widths[modes]
-        costs = probs.new_tensor([0.0, 0.125, 0.25, 0.50, 1.0])
-        expected_compute = (probs * costs).sum(dim=-1).sum(dim=-1).mean()
-        hard_compute = costs[modes].sum(dim=-1).mean()
+        expected_compute, hard_compute, costs = self._computational_potential_cost(probs, modes)
         active = selected_widths != 0
         path_ids = torch.zeros(modes.size(0), dtype=torch.long, device=modes.device)
         for layer in range(modes.size(1)):
@@ -2701,7 +2805,10 @@ class GPT(nn.Module):
             "top16_coverage": coverage(16),
             "average_compute": hard_compute.item(),
             "expected_compute": expected_compute.item(),
-            "compute_saving": 1.0 - hard_compute.item() / self.config.n_layer,
+            "potential_cost": hard_compute.item(),
+            "compute_saving": 1.0 - hard_compute.item() / max(
+                costs[-1].item() * self.config.n_layer, 1e-9
+            ),
             "average_active_layers": active.float().sum(dim=-1).mean().item(),
             "average_width": selected_widths.float().mean().item(),
             "average_active_width": selected_widths.sum().float().div(active.sum().clamp_min(1)).item(),
@@ -2779,6 +2886,9 @@ class GPT(nn.Module):
             full_ce = F.cross_entropy(
                 full_logits.reshape(-1, full_logits.size(-1)), targets.reshape(-1), ignore_index=-1
             )
+            utility_loss, utility, utility_target = self._dynamic_resource_utility_loss(
+                idx, saved_probs, full_logits, targets
+            )
             temperature = self.config.dynamic_resource_distill_temperature
             per_token_kl = F.kl_div(
                 F.log_softmax(logits / temperature, dim=-1),
@@ -2786,12 +2896,25 @@ class GPT(nn.Module):
             ).sum(dim=-1)
             valid = targets != -1
             distill = per_token_kl[valid].mean() * (temperature * temperature)
-            costs = saved_probs.new_tensor([0.0, 0.125, 0.25, 0.50, 1.0])
-            expected_compute = (saved_probs * costs).sum(dim=-1).sum(dim=-1).mean()
+            expected_compute, _, _ = self._computational_potential_cost(
+                saved_probs, saved_modes
+            )
+            potential_lambda = (
+                self.config.computational_potential_lambda
+                if self.config.computational_potential_enabled
+                else self.config.dynamic_resource_compute_penalty_current
+            )
+            quality_gap = F.relu(
+                dynamic_ce - full_ce - self.config.computational_potential_quality_tolerance
+            )
             loss = (dynamic_ce
                     + self.config.dynamic_resource_full_ce_weight * full_ce
                     + self.config.dynamic_resource_distill_weight * distill
-                    + self.config.dynamic_resource_compute_penalty_current * expected_compute)
+                    + potential_lambda * expected_compute
+                    + (self.config.computational_potential_quality_penalty
+                       * quality_gap if self.config.computational_potential_enabled else 0.0))
+            if utility_loss is not None:
+                loss = loss + self.config.computational_potential_utility_weight * utility_loss
             self.last_dynamic_resource_logits = saved_logits
             self.last_dynamic_resource_probs = saved_probs
             self.last_dynamic_resource_modes = saved_modes
@@ -2802,9 +2925,17 @@ class GPT(nn.Module):
                 "dynamic_resource_full_ce": full_ce.detach().item(),
                 "dynamic_resource_distill": distill.detach().item(),
                 "dynamic_resource_expected_compute": expected_compute.detach().item(),
-                "dynamic_resource_compute_weight": self.config.dynamic_resource_compute_penalty_current,
+                "dynamic_resource_compute_weight": potential_lambda,
+                "computational_potential_quality_gap": quality_gap.detach().item(),
                 "total_loss": loss.detach().item(),
             }
+            if utility_loss is not None:
+                self.last_loss_stats.update({
+                    "computational_potential_utility_loss": utility_loss.detach().item(),
+                    "computational_potential_utility_mean": utility.mean().item(),
+                    "computational_potential_utility_std": utility.std().item(),
+                    "computational_potential_target_active": utility_target.mean().item(),
+                })
             return logits, loss
 
         if self.config.enable_dynamic_depth and targets is None and not self.training:

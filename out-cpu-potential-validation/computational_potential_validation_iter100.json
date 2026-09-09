@@ -1,0 +1,88 @@
+{
+  "checkpoint": "out-cpu-potential-validation/ckpt_iter_100.pt",
+  "step": 100,
+  "device": "cpu",
+  "samples": 16,
+  "block_size": 64,
+  "seed": 1337,
+  "calibration_latency_ms": [
+    0.8529999997790583,
+    0.9217709998665669,
+    0.8760830000937858,
+    0.9834995000801428,
+    1.089166999918234
+  ],
+  "cost_profile_ms_per_layer": [
+    0.0,
+    0.017192750021877146,
+    0.0057707500786818855,
+    0.03262487507527112,
+    0.05904175003479395
+  ],
+  "cost_monotonic_nonincreasing": true,
+  "route_repeat_stability_min": 1.0,
+  "input_conditioned_cost": true,
+  "pareto_lambda_count": 1,
+  "rows": [
+    {
+      "lambda": 0.0,
+      "loss": 2.5367491543293,
+      "latency_ms": 1.1026146250401325,
+      "cost": 0.20809906162321568,
+      "loss_std": 0.13602205481998053,
+      "latency_std": 0.07034345237406059,
+      "cost_std": 0.006394505607016931,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 0.1,
+      "loss": 2.5367491543293,
+      "latency_ms": 1.027354187471019,
+      "cost": 0.20809906162321568,
+      "loss_std": 0.13602205481998053,
+      "latency_std": 0.056375717420222814,
+      "cost_std": 0.006394505607016931,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 0.25,
+      "loss": 2.5367491543293,
+      "latency_ms": 1.0707005624794874,
+      "cost": 0.20809906162321568,
+      "loss_std": 0.13602205481998053,
+      "latency_std": 0.07832098073453737,
+      "cost_std": 0.006394505607016931,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 0.5,
+      "loss": 2.5367491543293,
+      "latency_ms": 1.0040753751354714,
+      "cost": 0.20809906162321568,
+      "loss_std": 0.13602205481998053,
+      "latency_std": 0.050578404326179834,
+      "cost_std": 0.006394505607016931,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 1.0,
+      "loss": 2.5367491543293,
+      "latency_ms": 1.0098152499153912,
+      "cost": 0.20809906162321568,
+      "loss_std": 0.13602205481998053,
+      "latency_std": 0.08307752499259594,
+      "cost_std": 0.006394505607016931,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 2.0,
+      "loss": 2.536413997411728,
+      "latency_ms": 0.9961901250221672,
+      "cost": 0.2064480073750019,
+      "loss_std": 0.1365232063766363,
+      "latency_std": 0.05376782110905116,
+      "cost_std": 0.008736557883700678,
+      "unique_paths": 2
+    }
+  ]
+}

@@ -101,6 +101,17 @@ dynamic_resource_distill_temperature = 2.0
 dynamic_resource_full_ce_weight = 0.5
 dynamic_resource_collapse_threshold = 0.95
 dynamic_resource_eval_impl = "physical"
+# Shared computational-potential pricing.  Leave disabled to reproduce the
+# legacy FLOPs-proxy experiments; enable it with a measured action profile.
+computational_potential_enabled = False
+computational_potential_lambda = 0.0
+computational_potential_cost_profile = None
+computational_potential_fixed_cost = 0.0
+computational_potential_group_cost = 0.0
+computational_potential_quality_tolerance = 0.02
+computational_potential_quality_penalty = 5.0
+computational_potential_utility_weight = 0.0
+computational_potential_utility_scale = 0.05
 # dynamic MLP capacity routing
 dynamic_mlp = False
 dynamic_mlp_fast_ratio = 1.0
@@ -319,6 +330,15 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   dynamic_resource_full_ce_weight=dynamic_resource_full_ce_weight,
                   dynamic_resource_collapse_threshold=dynamic_resource_collapse_threshold,
                   dynamic_resource_eval_impl=dynamic_resource_eval_impl,
+                  computational_potential_enabled=computational_potential_enabled,
+                  computational_potential_lambda=computational_potential_lambda,
+                  computational_potential_cost_profile=computational_potential_cost_profile,
+                  computational_potential_fixed_cost=computational_potential_fixed_cost,
+                  computational_potential_group_cost=computational_potential_group_cost,
+                  computational_potential_quality_tolerance=computational_potential_quality_tolerance,
+                  computational_potential_quality_penalty=computational_potential_quality_penalty,
+                  computational_potential_utility_weight=computational_potential_utility_weight,
+                  computational_potential_utility_scale=computational_potential_utility_scale,
                   dynamic_mlp=dynamic_mlp,
                   dynamic_mlp_fast_ratio=dynamic_mlp_fast_ratio,
                   dynamic_mlp_slow_ratio=dynamic_mlp_slow_ratio,

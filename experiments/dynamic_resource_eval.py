@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import json
 import math
 import os
 import pickle
@@ -56,7 +57,6 @@ def evaluate(model, data, batches, batch_size, block_size, device):
     dynamic_nll = full_nll = 0.0
     tokens = requests = 0
     expected_compute = entropy_sum = confidence_sum = 0.0
-    costs = torch.tensor([0.0, 0.125, 0.25, 0.50, 1.0], device=device)
     hard_cost = active_layers = width_sum = 0.0
 
     for _ in range(batches):
@@ -78,8 +78,9 @@ def evaluate(model, data, batches, batch_size, block_size, device):
             pattern_paths[int(x[row, 0].item())][path] += 1
         requests += x.size(0)
         tokens += y.numel()
-        expected_compute += (probs * costs).sum(dim=-1).sum().item()
-        hard_cost += costs[modes].sum().item()
+        batch_expected, batch_hard, costs = model._computational_potential_cost(probs, modes)
+        expected_compute += batch_expected.item() * x.size(0)
+        hard_cost += batch_hard.item() * x.size(0)
         active_layers += (selected_widths != 0).sum().item()
         width_sum += selected_widths.sum().item()
         entropy_sum += (-(probs.clamp_min(1e-9) * probs.clamp_min(1e-9).log())
@@ -101,7 +102,11 @@ def evaluate(model, data, batches, batch_size, block_size, device):
         "delta_ppl": math.exp(dynamic_loss) - math.exp(full_loss),
         "average_compute": average_compute,
         "expected_compute": expected_compute / requests,
-        "compute_saving": 1.0 - average_compute / model.config.n_layer,
+        "compute_saving": 1.0 - average_compute / max(
+            float(costs[-1].item() * model.config.n_layer
+                  + model.config.computational_potential_fixed_cost * model.config.n_layer), 1e-9
+        ),
+        "potential_cost_currency": "configured_profile",
         "average_active_layers": active_layers / requests,
         "skip_fraction": 1.0 - active_layers / (requests * model.config.n_layer),
         "average_width": width_sum / (requests * model.config.n_layer),
@@ -229,10 +234,26 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--output-csv", default=None)
+    parser.add_argument("--cost-profile", default=None,
+                        help="JSON profile or comma-separated costs, one per route action")
+    parser.add_argument("--potential-lambda", type=float, default=None,
+                        help="deploy-time price per cost-currency unit")
     args = parser.parse_args()
     device = torch.device(args.device)
     model, step = load_model(args.checkpoint, device)
     assert model.config.dynamic_resource
+    if args.cost_profile:
+        if os.path.exists(args.cost_profile):
+            with open(args.cost_profile, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            profile = payload.get("cost_profile_ms_per_layer", payload)
+        else:
+            profile = [float(value) for value in args.cost_profile.split(",")]
+        model.config.computational_potential_cost_profile = profile
+        model.config.computational_potential_enabled = True
+    if args.potential_lambda is not None:
+        model.config.computational_potential_lambda = args.potential_lambda
+        model.config.computational_potential_enabled = True
     data = load_data(args.data)
     block_size = min(args.block_size, model.config.block_size)
     metrics = evaluate(model, data, args.batches, args.batch_size, block_size, device)

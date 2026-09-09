@@ -1,0 +1,88 @@
+{
+  "checkpoint": "out-cpu-potential-validation/ckpt.pt",
+  "step": 300,
+  "device": "cpu",
+  "samples": 16,
+  "block_size": 64,
+  "seed": 1337,
+  "calibration_latency_ms": [
+    0.7390209998447972,
+    0.9491040002558293,
+    0.8419585001320229,
+    0.9530004999760422,
+    1.0254999999688152
+  ],
+  "cost_profile_ms_per_layer": [
+    0.0,
+    0.05252075010275803,
+    0.025734375071806426,
+    0.05349487503281125,
+    0.07161975003100451
+  ],
+  "cost_monotonic_nonincreasing": true,
+  "route_repeat_stability_min": 1.0,
+  "input_conditioned_cost": false,
+  "pareto_lambda_count": 1,
+  "rows": [
+    {
+      "lambda": 0.0,
+      "loss": 2.381551057100296,
+      "latency_ms": 1.0193229374806378,
+      "cost": 0.25022923946380615,
+      "loss_std": 0.1528618698509717,
+      "latency_std": 0.08848074370861032,
+      "cost_std": 0.0,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 0.1,
+      "loss": 2.381551057100296,
+      "latency_ms": 0.9930415625092337,
+      "cost": 0.25022923946380615,
+      "loss_std": 0.1528618698509717,
+      "latency_std": 0.08539984893662797,
+      "cost_std": 0.0,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 0.25,
+      "loss": 2.381551057100296,
+      "latency_ms": 1.0138071249343739,
+      "cost": 0.25022923946380615,
+      "loss_std": 0.1528618698509717,
+      "latency_std": 0.09805550447733734,
+      "cost_std": 0.0,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 0.5,
+      "loss": 2.381551057100296,
+      "latency_ms": 0.9914374999766551,
+      "cost": 0.25022923946380615,
+      "loss_std": 0.1528618698509717,
+      "latency_std": 0.07298025544575024,
+      "cost_std": 0.0,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 1.0,
+      "loss": 2.381551057100296,
+      "latency_ms": 0.9920782499364122,
+      "cost": 0.25022923946380615,
+      "loss_std": 0.1528618698509717,
+      "latency_std": 0.10369611387899513,
+      "cost_std": 0.0,
+      "unique_paths": 2
+    },
+    {
+      "lambda": 2.0,
+      "loss": 2.381551057100296,
+      "latency_ms": 0.9987161873823425,
+      "cost": 0.25022923946380615,
+      "loss_std": 0.1528618698509717,
+      "latency_std": 0.0856927119434362,
+      "cost_std": 0.0,
+      "unique_paths": 2
+    }
+  ]
+}
