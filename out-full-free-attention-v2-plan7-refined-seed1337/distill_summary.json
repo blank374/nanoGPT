@@ -1,0 +1,67 @@
+{
+  "student_source": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-plan7-distilled-best-seed1337/ckpt.pt",
+  "teacher_source": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-budget72-quality-seed1337/ckpt.pt",
+  "fast_attention_plan": [
+    0,
+    1,
+    2,
+    4,
+    5,
+    6,
+    7
+  ],
+  "history": [
+    {
+      "nll": 2.0460625886917114,
+      "ppl": 7.737375819390723,
+      "active_cells": 22.3418212890625,
+      "active_attention": 7.0,
+      "iteration": 0
+    },
+    {
+      "nll": 2.058577466011047,
+      "ppl": 7.834816586387845,
+      "active_cells": 22.4254150390625,
+      "active_attention": 7.0,
+      "iteration": 100
+    },
+    {
+      "nll": 2.0358555197715758,
+      "ppl": 7.658801579663374,
+      "active_cells": 22.4249267578125,
+      "active_attention": 7.0,
+      "iteration": 200
+    },
+    {
+      "nll": 2.0436282575130464,
+      "ppl": 7.718563391322782,
+      "active_cells": 22.4357177734375,
+      "active_attention": 7.0,
+      "iteration": 300
+    },
+    {
+      "nll": 2.0352175176143645,
+      "ppl": 7.653916806147611,
+      "active_cells": 22.4614501953125,
+      "active_attention": 7.0,
+      "iteration": 400
+    },
+    {
+      "nll": 2.0315042972564696,
+      "ppl": 7.625548827318453,
+      "active_cells": 22.47578125,
+      "active_attention": 7.0,
+      "iteration": 500
+    },
+    {
+      "nll": 2.0440478920936584,
+      "ppl": 7.721803047122688,
+      "active_cells": 22.5059326171875,
+      "active_attention": 7.0,
+      "iteration": 600
+    }
+  ],
+  "best_iteration": 500,
+  "best_nll": 2.0315042972564696,
+  "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-plan7-refined-seed1337\\ckpt.pt"
+}

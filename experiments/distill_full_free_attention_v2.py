@@ -149,6 +149,9 @@ def main():
     train_generator = torch.Generator().manual_seed(args.seed + 1)
     val_generator = torch.Generator().manual_seed(args.seed + 2)
     history = []
+    best_nll = float("inf")
+    best_iteration = 0
+    best_state = None
     os.makedirs(os.path.join(ROOT, args.out_dir), exist_ok=True)
 
     for iteration in range(args.iterations + 1):
@@ -157,6 +160,13 @@ def main():
             metrics["iteration"] = iteration
             history.append(metrics)
             print(json.dumps(metrics))
+            if metrics["nll"] < best_nll:
+                best_nll = metrics["nll"]
+                best_iteration = iteration
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in student.state_dict().items()
+                }
             if iteration == args.iterations:
                 break
 
@@ -187,12 +197,13 @@ def main():
     model_args["cell_graph_temperature"] = student.cell_graph.temperature
     model_args["cell_graph_dual_value"] = student.config.cell_graph_dual_value
     output = {
-        "model": student.state_dict(),
+        "model": best_state,
         "optimizer": optimizer.state_dict(),
         "model_args": model_args,
-        "iter_num": args.iterations,
-        "best_val_loss": min(row["nll"] for row in history),
+        "iter_num": best_iteration,
+        "best_val_loss": best_nll,
         "config": vars(args),
+        "attention_plan": fast_plan.detach().cpu(),
     }
     checkpoint_path = os.path.join(ROOT, args.out_dir, "ckpt.pt")
     torch.save(output, checkpoint_path)
@@ -201,6 +212,8 @@ def main():
         "teacher_source": teacher_path,
         "fast_attention_plan": fast_plan.nonzero().flatten().tolist(),
         "history": history,
+        "best_iteration": best_iteration,
+        "best_nll": best_nll,
         "checkpoint": checkpoint_path,
     }
     with open(os.path.join(ROOT, args.out_dir, "distill_summary.json"), "w", encoding="utf-8") as handle:

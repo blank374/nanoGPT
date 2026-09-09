@@ -1,0 +1,82 @@
+{
+  "architecture": "full-free-attention-v2",
+  "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-plan7-refined-seed1337\\ckpt.pt",
+  "checkpoint_iter": 500,
+  "device": "cuda",
+  "dtype": "float16",
+  "batch_size": 16,
+  "block_size": 128,
+  "mean_nll": 2.0488411521911623,
+  "ppl": 7.758904504983141,
+  "mean_active_cells": 22.495595703125,
+  "mean_active_attention_steps": 7.0,
+  "mean_active_attention_ratio": 0.875,
+  "mean_physically_executed_attention_steps_per_batch": 7.0,
+  "attention_step_usage": [
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "mandatory_attention_steps": [
+    0,
+    2,
+    5,
+    7
+  ],
+  "dense_masked_latency_ms": 93.55331420898438,
+  "physical_skip_latency_ms": 93.701123046875,
+  "physical_speedup_x": 0.9984225499856957,
+  "physical_latency_reduction_fraction": -0.0015799422942990304,
+  "physical_vs_dense_logits_max_abs_diff": 0.0,
+  "physical_vs_dense_attention_masks_equal": true,
+  "condense_threshold": 0.01,
+  "fixed_attention_plan": [
+    0,
+    1,
+    2,
+    4,
+    5,
+    6,
+    7
+  ],
+  "condensed_attention_plan": [
+    0,
+    1,
+    2,
+    4,
+    5,
+    6,
+    7
+  ],
+  "condensed_attention_steps": 7,
+  "condensed_nll": 2.0488411521911623,
+  "condensed_ppl": 7.758904504983141,
+  "condensed_nll_delta": 0.0,
+  "condensed_latency_ms": 95.477978515625,
+  "condensed_vs_dense_speedup_x": 0.9798417987418361,
+  "condensed_vs_dense_latency_reduction_fraction": -0.02057291420313767,
+  "condensed_cell_queue_latency_ms": 111.88466796875,
+  "condensed_cell_queue_vs_dense_speedup_x": 0.8361584827253931,
+  "condensed_cell_queue_vs_dense_latency_reduction_fraction": -0.19594553025471728,
+  "condensed_cell_queue_logits_max_abs_diff": 0.0,
+  "interleaved_iterations_per_sample": 2,
+  "interleaved_dense_samples_ms": [
+    89.07093048095703,
+    90.90351867675781,
+    88.6602554321289
+  ],
+  "interleaved_condensed_cell_queue_samples_ms": [
+    110.93059539794922,
+    108.36774444580078,
+    112.41238403320312
+  ],
+  "interleaved_dense_median_ms": 89.07093048095703,
+  "interleaved_condensed_cell_queue_median_ms": 110.93059539794922,
+  "interleaved_speedup_x": 0.8029428685695461,
+  "interleaved_latency_reduction_fraction": -0.24541862085594457
+}

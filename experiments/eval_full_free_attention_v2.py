@@ -31,6 +31,10 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--condense_threshold", type=float, default=0.01)
+    parser.add_argument(
+        "--fixed_plan", default="",
+        help="comma-separated Attention steps; evaluates a persisted shared Fast Path",
+    )
     parser.add_argument("--interleaved_repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--json", default="full_free_attention_v2_eval.json")
@@ -115,6 +119,19 @@ def main():
     checkpoint_path = os.path.join(ROOT, args.out_dir, args.checkpoint)
     model, checkpoint = load_model(checkpoint_path, device)
     graph = model.cell_graph
+    fixed_plan = None
+    saved_plan = checkpoint.get("attention_plan")
+    saved_plan_text = checkpoint.get("config", {}).get("plan", "")
+    if args.fixed_plan:
+        fixed_plan = torch.zeros(graph.num_steps, dtype=torch.bool, device=device)
+        fixed_plan[[int(value) for value in args.fixed_plan.split(",")]] = True
+    elif saved_plan is not None:
+        fixed_plan = saved_plan.to(device=device, dtype=torch.bool)
+    elif saved_plan_text:
+        fixed_plan = torch.zeros(graph.num_steps, dtype=torch.bool, device=device)
+        fixed_plan[[int(value) for value in saved_plan_text.split(",")]] = True
+    if fixed_plan is not None:
+        graph.attention_plan_override = fixed_plan
     data = np.memmap(
         os.path.join(ROOT, "data", "shakespeare_char", "val.bin"),
         dtype=np.uint16, mode="r",
@@ -162,8 +179,8 @@ def main():
     # graph, not a hand-authored depth choice.
     step_usage = torch.stack(per_step).mean(dim=0)
     condensed_plan = (
-        (step_usage >= args.condense_threshold)
-        | graph.attention_anchor_mask.cpu()
+        fixed_plan.cpu() if fixed_plan is not None else
+        (step_usage >= args.condense_threshold) | graph.attention_anchor_mask.cpu()
     )
     graph.attention_plan_override = condensed_plan.to(device)
     condensed_losses = []
@@ -189,18 +206,26 @@ def main():
         condensed_dense_logits.float() - condensed_queue_logits.float()
     ).abs().max().item()
 
-    interleaved = {"dense_masked": [], "condensed_cell_queue": []}
+    interleaved = {
+        "dense_masked": [],
+        "condensed_dense_cells": [],
+        "condensed_cell_queue": [],
+    }
     interleaved_iterations = max(2, args.iterations // 4)
     for repeat in range(args.interleaved_repeats):
         order = (
-            ("dense_masked", "condensed_cell_queue")
+            ("dense_masked", "condensed_dense_cells", "condensed_cell_queue")
             if repeat % 2 == 0 else
-            ("condensed_cell_queue", "dense_masked")
+            ("condensed_cell_queue", "condensed_dense_cells", "dense_masked")
         )
         for mode in order:
             if mode == "dense_masked":
                 graph.force_dense_attention_execution = True
                 graph.attention_plan_override = None
+                graph.physical_cell_execution = False
+            elif mode == "condensed_dense_cells":
+                graph.force_dense_attention_execution = False
+                graph.attention_plan_override = condensed_plan.to(device)
                 graph.physical_cell_execution = False
             else:
                 graph.force_dense_attention_execution = False
@@ -213,6 +238,9 @@ def main():
     graph.attention_plan_override = None
     graph.physical_cell_execution = False
     dense_interleaved_median = statistics.median(interleaved["dense_masked"])
+    fast_path_interleaved_median = statistics.median(
+        interleaved["condensed_dense_cells"]
+    )
     queue_interleaved_median = statistics.median(interleaved["condensed_cell_queue"])
     result = {
         "architecture": graph.architecture_name,
@@ -237,6 +265,9 @@ def main():
         "physical_vs_dense_logits_max_abs_diff": max_abs_diff,
         "physical_vs_dense_attention_masks_equal": masks_equal,
         "condense_threshold": args.condense_threshold,
+        "fixed_attention_plan": (
+            fixed_plan.nonzero().flatten().tolist() if fixed_plan is not None else None
+        ),
         "condensed_attention_plan": condensed_plan.nonzero().flatten().tolist(),
         "condensed_attention_steps": int(condensed_plan.sum().item()),
         "condensed_nll": condensed_nll,
@@ -251,8 +282,12 @@ def main():
         "condensed_cell_queue_logits_max_abs_diff": queue_max_abs_diff,
         "interleaved_iterations_per_sample": interleaved_iterations,
         "interleaved_dense_samples_ms": interleaved["dense_masked"],
+        "interleaved_condensed_dense_cells_samples_ms": interleaved["condensed_dense_cells"],
         "interleaved_condensed_cell_queue_samples_ms": interleaved["condensed_cell_queue"],
         "interleaved_dense_median_ms": dense_interleaved_median,
+        "interleaved_condensed_dense_cells_median_ms": fast_path_interleaved_median,
+        "interleaved_fast_path_speedup_x": dense_interleaved_median / fast_path_interleaved_median,
+        "interleaved_fast_path_latency_reduction_fraction": 1.0 - fast_path_interleaved_median / dense_interleaved_median,
         "interleaved_condensed_cell_queue_median_ms": queue_interleaved_median,
         "interleaved_speedup_x": dense_interleaved_median / queue_interleaved_median,
         "interleaved_latency_reduction_fraction": 1.0 - queue_interleaved_median / dense_interleaved_median,
