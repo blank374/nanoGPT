@@ -1,0 +1,239 @@
+{
+  "checkpoint": "D:\\GitHub\\nanoGPT\\out-full-free-attention-v2-plan7-refined-seed1337\\ckpt.pt",
+  "device": "cuda",
+  "dtype": "float16",
+  "batch_size": 16,
+  "block_size": 128,
+  "parallel_streams": false,
+  "attention_plan": [
+    0,
+    1,
+    2,
+    4,
+    5,
+    6,
+    7
+  ],
+  "active_cells": 22.564453125,
+  "event_stats": {
+    "steps": 8,
+    "submitted_jobs": 32,
+    "ready_events": 46212,
+    "nonempty_cell_queues": 32,
+    "cell_launches": 32,
+    "coalesced_jobs": 0,
+    "mean_queue_size": 1444.125,
+    "max_queue_size": 2048,
+    "mean_fan_in": 3.442958538907643,
+    "parallel_streams": false,
+    "per_step": [
+      {
+        "submitted_jobs": 4,
+        "ready_events": 6592,
+        "nonempty_cell_queues": 4,
+        "cell_launches": 4,
+        "coalesced_jobs": 0,
+        "mean_queue_size": 1648.0,
+        "max_queue_size": 2048,
+        "mean_fan_in": 1.0,
+        "parallel_streams": false,
+        "dispatch_order": [
+          2,
+          3,
+          1,
+          0
+        ],
+        "queue_sizes": {
+          "2": 2048,
+          "3": 1973,
+          "1": 1615,
+          "0": 956
+        }
+      },
+      {
+        "submitted_jobs": 4,
+        "ready_events": 7463,
+        "nonempty_cell_queues": 4,
+        "cell_launches": 4,
+        "coalesced_jobs": 0,
+        "mean_queue_size": 1865.75,
+        "max_queue_size": 2032,
+        "mean_fan_in": 3.3038992362320783,
+        "parallel_streams": false,
+        "dispatch_order": [
+          5,
+          4,
+          7,
+          6
+        ],
+        "queue_sizes": {
+          "5": 2032,
+          "4": 1974,
+          "7": 1775,
+          "6": 1682
+        }
+      },
+      {
+        "submitted_jobs": 4,
+        "ready_events": 5736,
+        "nonempty_cell_queues": 4,
+        "cell_launches": 4,
+        "coalesced_jobs": 0,
+        "mean_queue_size": 1434.0,
+        "max_queue_size": 2046,
+        "mean_fan_in": 4.443688981868898,
+        "parallel_streams": false,
+        "dispatch_order": [
+          10,
+          9,
+          8,
+          11
+        ],
+        "queue_sizes": {
+          "10": 2046,
+          "9": 1823,
+          "8": 1188,
+          "11": 679
+        }
+      },
+      {
+        "submitted_jobs": 4,
+        "ready_events": 5910,
+        "nonempty_cell_queues": 4,
+        "cell_launches": 4,
+        "coalesced_jobs": 0,
+        "mean_queue_size": 1477.5,
+        "max_queue_size": 1830,
+        "mean_fan_in": 4.397969543147208,
+        "parallel_streams": false,
+        "dispatch_order": [
+          12,
+          15,
+          13,
+          14
+        ],
+        "queue_sizes": {
+          "12": 1830,
+          "15": 1590,
+          "13": 1270,
+          "14": 1220
+        }
+      },
+      {
+        "submitted_jobs": 4,
+        "ready_events": 5534,
+        "nonempty_cell_queues": 4,
+        "cell_launches": 4,
+        "coalesced_jobs": 0,
+        "mean_queue_size": 1383.5,
+        "max_queue_size": 1474,
+        "mean_fan_in": 4.1532345500542105,
+        "parallel_streams": false,
+        "dispatch_order": [
+          16,
+          19,
+          18,
+          17
+        ],
+        "queue_sizes": {
+          "16": 1474,
+          "19": 1441,
+          "18": 1430,
+          "17": 1189
+        }
+      },
+      {
+        "submitted_jobs": 4,
+        "ready_events": 5575,
+        "nonempty_cell_queues": 4,
+        "cell_launches": 4,
+        "coalesced_jobs": 0,
+        "mean_queue_size": 1393.75,
+        "max_queue_size": 1597,
+        "mean_fan_in": 3.8229596412556055,
+        "parallel_streams": false,
+        "dispatch_order": [
+          20,
+          22,
+          21,
+          23
+        ],
+        "queue_sizes": {
+          "20": 1597,
+          "22": 1396,
+          "21": 1333,
+          "23": 1249
+        }
+      },
+      {
+        "submitted_jobs": 4,
+        "ready_events": 4368,
+        "nonempty_cell_queues": 4,
+        "cell_launches": 4,
+        "coalesced_jobs": 0,
+        "mean_queue_size": 1092.0,
+        "max_queue_size": 1388,
+        "mean_fan_in": 3.7261904761904763,
+        "parallel_streams": false,
+        "dispatch_order": [
+          26,
+          24,
+          25,
+          27
+        ],
+        "queue_sizes": {
+          "26": 1388,
+          "24": 1117,
+          "25": 989,
+          "27": 874
+        }
+      },
+      {
+        "submitted_jobs": 4,
+        "ready_events": 5034,
+        "nonempty_cell_queues": 4,
+        "cell_launches": 4,
+        "coalesced_jobs": 0,
+        "mean_queue_size": 1258.5,
+        "max_queue_size": 1453,
+        "mean_fan_in": 3.139253079062376,
+        "parallel_streams": false,
+        "dispatch_order": [
+          30,
+          29,
+          31,
+          28
+        ],
+        "queue_sizes": {
+          "30": 1453,
+          "29": 1404,
+          "31": 1326,
+          "28": 851
+        }
+      }
+    ]
+  },
+  "logits_max_abs_diff": {
+    "legacy_queue": 0.0,
+    "event_queue": 0.0
+  },
+  "samples_ms": {
+    "dense_cells": [
+      99.17337799072266
+    ],
+    "legacy_queue": [
+      112.70963287353516
+    ],
+    "event_queue": [
+      117.06470489501953
+    ]
+  },
+  "median_ms": {
+    "dense_cells": 99.17337799072266,
+    "legacy_queue": 112.70963287353516,
+    "event_queue": 117.06470489501953
+  },
+  "legacy_speedup_x": 0.8799015262697135,
+  "event_speedup_x": 0.847167197659266,
+  "event_latency_reduction_fraction": -0.18040453261530076
+}

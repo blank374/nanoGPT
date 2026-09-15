@@ -27,6 +27,10 @@ import torch
 import torch.nn.functional as F
 
 from model import FullFreeDynamicCellGraph, GPT
+from experiments.event_driven_cell_executor import (
+    CellEventBatch,
+    EventDrivenCellExecutor,
+)
 
 
 def evenly_spaced_anchors(num_steps, count):
@@ -71,6 +75,10 @@ class FullFreeAttentionDynamicCellGraphV2(FullFreeDynamicCellGraph):
         # every token onto one shared, hardware-friendly Attention plan.
         self.attention_plan_override = None
         self.physical_cell_execution = False
+        self.event_driven_execution = False
+        self.event_parallel_streams = False
+        self.event_executor = EventDrivenCellExecutor()
+        self.last_event_executor_stats = None
 
     @staticmethod
     def _attention_gate(cell_weights, node_masks, anchor, training):
@@ -117,6 +125,7 @@ class FullFreeAttentionDynamicCellGraphV2(FullFreeDynamicCellGraph):
         attention_prob_records = []
         attention_mask_records = []
         attention_executed_records = []
+        event_stats_records = []
         alive = torch.ones(B, T, device=anchor.device, dtype=anchor.dtype)
 
         for step in range(self.num_steps):
@@ -198,6 +207,7 @@ class FullFreeAttentionDynamicCellGraphV2(FullFreeDynamicCellGraph):
                 self.config.cell_graph_edge_selector,
             )
 
+            pending_cells = []
             for offset in range(self.cells_per_step):
                 node = step * self.cells_per_step + offset
                 edge_weights = step_edge_weights[..., offset, :]
@@ -215,7 +225,17 @@ class FullFreeAttentionDynamicCellGraphV2(FullFreeDynamicCellGraph):
                 ).clamp_min(1e-6)
                 projected = self._project_sources(node, sources)
                 fused = (projected * edge_weights.unsqueeze(-1)).sum(dim=2)
-                if self.physical_cell_execution and not self.training:
+                dependency_count = ((edge_weights > 0) & available).sum(dim=-1)
+                if self.event_driven_execution and not self.training:
+                    pending_cells.append((
+                        node,
+                        offset,
+                        fused,
+                        node_masks[..., offset],
+                        dependency_count,
+                    ))
+                    delta = None
+                elif self.physical_cell_execution and not self.training:
                     active_flat = node_masks[..., offset].reshape(-1)
                     fused_flat = fused.reshape(B * T, -1)
                     delta_flat = torch.zeros_like(fused_flat)
@@ -228,10 +248,11 @@ class FullFreeAttentionDynamicCellGraphV2(FullFreeDynamicCellGraph):
                 else:
                     fused = self.input_norms[node](fused)
                     delta = self.cells[node](fused)
-                step_deltas.append(delta)
-                cell_outputs[node] = delta
-                cell_source_features[node] = self.router.source_down(delta)
-                cell_available[node] = node_masks[..., offset]
+                if delta is not None:
+                    step_deltas.append(delta)
+                    cell_outputs[node] = delta
+                    cell_source_features[node] = self.router.source_down(delta)
+                    cell_available[node] = node_masks[..., offset]
 
                 padded_weights = torch.zeros(
                     B, T, 1 + self.num_cells,
@@ -248,6 +269,30 @@ class FullFreeAttentionDynamicCellGraphV2(FullFreeDynamicCellGraph):
                     (padded_weights > 0) & node_masks[..., offset, None]
                 )
                 edge_score_records.append(padded_scores)
+
+            if self.event_driven_execution and not self.training:
+                jobs = [
+                    CellEventBatch(
+                        cell_id=node,
+                        fused=fused,
+                        active=active,
+                        dependency_count=dependency_count,
+                    )
+                    for node, _, fused, active, dependency_count in pending_cells
+                ]
+                event_deltas = self.event_executor.execute(
+                    jobs,
+                    self.input_norms,
+                    self.cells,
+                    parallel_streams=self.event_parallel_streams,
+                )
+                event_stats_records.append(self.event_executor.last_stats)
+                for pending, delta in zip(pending_cells, event_deltas):
+                    node, offset, _, active, _ = pending
+                    step_deltas.append(delta)
+                    cell_outputs[node] = delta
+                    cell_source_features[node] = self.router.source_down(delta)
+                    cell_available[node] = active
 
             deltas = torch.stack(step_deltas, dim=2)
             current = current + (deltas * cell_weights.unsqueeze(-1)).sum(dim=2)
@@ -276,6 +321,9 @@ class FullFreeAttentionDynamicCellGraphV2(FullFreeDynamicCellGraph):
         self.last_attention_mask = torch.stack(attention_mask_records, dim=-1).detach()
         self.last_attention_executed_steps = torch.tensor(
             attention_executed_records, device=anchor.device, dtype=torch.bool
+        )
+        self.last_event_executor_stats = self.event_executor.aggregate_stats(
+            event_stats_records
         )
         return current
 
