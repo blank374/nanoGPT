@@ -106,6 +106,16 @@ early_exit_loss_weight = 0.3
 use_distillation = False
 distillation_temperature = 2.0
 distillation_beta = 0.5
+# optional decomposed predictive free-energy error signal
+free_energy_enabled = False
+free_energy_prediction_weight = 1.0
+free_energy_complexity_weight = 0.0
+free_energy_temperature = 1.0
+free_energy_update_fraction = 1.0
+cell_graph_free_energy_enabled = False
+cell_graph_free_energy_prediction_weight = 1.0
+cell_graph_free_energy_complexity_weight = 0.01
+cell_graph_free_energy_loss_weight = 0.0
 # request-level dynamic prefix depth (independent from MLP width routing)
 enable_dynamic_depth = False
 enable_dynamic_width = False
@@ -364,6 +374,15 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   use_distillation=use_distillation,
                   distillation_temperature=distillation_temperature,
                   distillation_beta=distillation_beta,
+                  free_energy_enabled=free_energy_enabled,
+                  free_energy_prediction_weight=free_energy_prediction_weight,
+                  free_energy_complexity_weight=free_energy_complexity_weight,
+                  free_energy_temperature=free_energy_temperature,
+                  free_energy_update_fraction=free_energy_update_fraction,
+                  cell_graph_free_energy_enabled=cell_graph_free_energy_enabled,
+                  cell_graph_free_energy_prediction_weight=cell_graph_free_energy_prediction_weight,
+                  cell_graph_free_energy_complexity_weight=cell_graph_free_energy_complexity_weight,
+                  cell_graph_free_energy_loss_weight=cell_graph_free_energy_loss_weight,
                   enable_dynamic_depth=enable_dynamic_depth,
                   enable_dynamic_width=enable_dynamic_width,
                   dynamic_depth_choices=dynamic_depth_choices,
@@ -516,6 +535,11 @@ elif init_from == 'resume':
               'dynamic_exit', 'exit_layers', 'confidence_method', 'confidence_threshold',
               'entropy_threshold', 'early_exit_loss_weight', 'use_distillation',
               'distillation_temperature', 'distillation_beta',
+              'free_energy_enabled', 'free_energy_prediction_weight',
+              'free_energy_complexity_weight', 'free_energy_temperature',
+              'free_energy_update_fraction',
+              'cell_graph_free_energy_enabled', 'cell_graph_free_energy_prediction_weight',
+              'cell_graph_free_energy_complexity_weight', 'cell_graph_free_energy_loss_weight',
               'enable_dynamic_depth', 'enable_dynamic_width', 'dynamic_depth_choices',
               'dynamic_depth_temperature', 'dynamic_depth_temperature_final',
               'dynamic_depth_temperature_anneal_iters', 'dynamic_depth_early_ce_weight',
@@ -1172,6 +1196,18 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
+            if raw_model.config.free_energy_enabled:
+                eval_loss_stats = raw_model.last_loss_stats or {}
+                wandb_metrics.update({
+                    "free_energy/prediction_error": eval_loss_stats.get(
+                        "free_energy_prediction_error", 0.0
+                    ),
+                    "free_energy/complexity": eval_loss_stats.get(
+                        "free_energy_complexity", 0.0
+                    ),
+                    "free_energy/total": eval_loss_stats.get("free_energy", 0.0),
+                    "free_energy/temperature": raw_model.config.free_energy_temperature,
+                })
             if graph_stats is not None:
                 wandb_metrics.update({
                     "cell_graph/active_cells": graph_stats["mean_active_cells"],
@@ -1365,6 +1401,14 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        loss_stats = raw_model.last_loss_stats or {}
+        if raw_model.config.free_energy_enabled:
+            print(
+                f"  free_energy: prediction_error={loss_stats.get('free_energy_prediction_error', 0.0):.4f}, "
+                f"complexity={loss_stats.get('free_energy_complexity', 0.0):.4f}, "
+                f"updated_fraction={loss_stats.get('free_energy_selected_fraction', 1.0):.3f}, "
+                f"total={loss_stats.get('free_energy', lossf):.4f}"
+            )
         graph_stats = raw_model.last_cell_graph_stats
         if graph_stats is not None:
             loss_stats = raw_model.last_loss_stats or {}
@@ -1381,6 +1425,13 @@ while True:
                 f"balance={loss_stats.get('cell_graph_balance_loss', 0.0):.5f}, "
                 f"expected_nodes={loss_stats.get('cell_graph_expected_node_ratio', 0.0):.3f}"
             )
+            if raw_model.config.cell_graph_free_energy_enabled:
+                print(
+                    f"  graph_free_energy: prediction_error="
+                    f"{loss_stats.get('cell_graph_free_energy_prediction_error', 0.0):.4f}, "
+                    f"complexity={loss_stats.get('cell_graph_free_energy_complexity', 0.0):.4f}, "
+                    f"total={loss_stats.get('cell_graph_free_energy', 0.0):.4f}"
+                )
             if cell_graph_mode == "full_free":
                 print(
                     f"    full_free: edges={graph_stats.get('mean_active_edges', 0.0):.2f}, "

@@ -93,10 +93,13 @@ def validate_frozen_v1(model):
                          + ", ".join(failures))
 
 
-def _sparse_forward(self, anchor):
+def _sparse_forward(self, anchor, halt_head=None, halt_threshold=0.5,
+                    physical_halt=False):
     """Semantics-preserving replacement for FullFreeDynamicCellGraph.forward."""
     validate_frozen_v1(types.SimpleNamespace(config=self.config, cell_graph=self,
                                               training=self.training))
+    if halt_head is not None or physical_halt:
+        raise ValueError("physical executor does not support halt-based early exit")
     B, T, C = anchor.shape
     requested_mode = getattr(self, "physical_executor_mode", "token_queue")
     if (requested_mode == "auto"

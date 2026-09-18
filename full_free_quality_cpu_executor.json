@@ -1,0 +1,40 @@
+[
+  {
+    "out_dir": "out-full-free-quality-cpu-seed1337",
+    "checkpoint": "/Users/linjiamin/Documents/nanoGPT/out-full-free-quality-cpu-seed1337/ckpt.pt",
+    "device": "cpu",
+    "amp_dtype": "float32",
+    "executor_mode": "token_queue",
+    "batch_size": 4,
+    "block_size": 64,
+    "dense_latency_ms": 34.17899790001684,
+    "sparse_latency_ms": 32.456079150142614,
+    "speedup_x": 1.0530846237434892,
+    "latency_reduction_fraction": 0.050408697028340166,
+    "dense_samples_ms": [
+      34.478916700027185,
+      33.87907910000649
+    ],
+    "sparse_samples_ms": [
+      32.59327080013463,
+      32.318887500150595
+    ],
+    "dense_nll": 2.2647275924682617,
+    "sparse_nll": 2.2647275924682617,
+    "nll_abs_diff": 0.0,
+    "logits_max_abs_diff": 1.9073486328125e-06,
+    "logits_mean_abs_diff": 3.937276815690893e-08,
+    "node_masks_equal": true,
+    "edge_masks_equal": true,
+    "semantic_check_passed": true,
+    "executor_selected": "token_queue",
+    "active_token_cell_pairs": 1478,
+    "possible_token_cell_pairs": 8192,
+    "active_pair_ratio": 0.180419921875,
+    "nonempty_cell_queues": 28,
+    "empty_cell_queues": 4,
+    "min_nonempty_queue": 3,
+    "mean_nonempty_queue": 52.785714285714285,
+    "max_nonempty_queue": 256
+  }
+]

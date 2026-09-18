@@ -1439,6 +1439,7 @@ class DynamicCellGraph(nn.Module):
         self.last_edge_probs = None
         self.last_edge_mask = None
         self.last_depth = None
+        self.last_step_states = None
 
     @staticmethod
     def _ste_binary(probs, threshold):
@@ -1456,7 +1457,8 @@ class DynamicCellGraph(nn.Module):
             valid[node, 1:1 + step * self.cells_per_step] = True
         return valid
 
-    def forward(self, anchor):
+    def forward(self, anchor, halt_head=None, halt_threshold=0.5,
+                physical_halt=False):
         B, T, _ = anchor.shape
         node_logits, edge_logits = self.router(anchor)
         temperature = max(float(self.temperature), 1e-4)
@@ -1484,7 +1486,11 @@ class DynamicCellGraph(nn.Module):
         cell_outputs = []
         edge_hard_records = []
         current = anchor
+        step_states = []
+        sequence_alive = torch.ones(B, device=anchor.device, dtype=torch.bool)
         for step in range(self.num_steps):
+            if physical_halt and halt_head is not None and not sequence_alive.any():
+                break
             if self.fixed_attentions is not None:
                 current = current + self.fixed_attentions[step](
                     self.fixed_attention_norms[step](current)
@@ -1553,6 +1559,10 @@ class DynamicCellGraph(nn.Module):
             mixed = (outputs * gates.unsqueeze(-1)).sum(dim=2) / gate_sum.clamp_min(1e-6)
             stage_active = 1.0 - torch.prod(1.0 - gates, dim=-1, keepdim=True)
             current = current + stage_active * (mixed - current)
+            step_states.append(current)
+            if physical_halt and halt_head is not None:
+                stop_probability = halt_head(current).squeeze(-1).sigmoid().mean(dim=1)
+                sequence_alive = sequence_alive & (stop_probability < halt_threshold)
 
         edge_hard = torch.stack(edge_hard_records, dim=2)
         self.last_node_probs = node_probs
@@ -1560,11 +1570,12 @@ class DynamicCellGraph(nn.Module):
         self.last_edge_probs = edge_probs
         self.last_edge_mask = edge_hard.detach()
         self.last_depth = self._hard_depth(node_hard.detach(), edge_hard.detach())
+        self.last_step_states = torch.stack(step_states, dim=2)
         return current
 
     def _hard_depth(self, node_mask, edge_mask):
         depths = [torch.zeros_like(node_mask[..., 0])]
-        for node in range(self.num_cells):
+        for node in range(edge_mask.size(2)):
             selected = edge_mask[:, :, node, :node + 1].bool()
             prior_depths = torch.stack(depths, dim=-1)
             parent_depth = prior_depths.masked_fill(~selected, -1).max(dim=-1).values.clamp_min(0)
@@ -1749,6 +1760,7 @@ class FullFreeDynamicCellGraph(nn.Module):
         self.last_halt_weights = None
         self.last_node_scores = None
         self.last_edge_scores = None
+        self.last_step_states = None
 
     def _candidate_indices(self, step):
         start_step = max(0, step - self.lookback_steps)
@@ -1826,7 +1838,8 @@ class FullFreeDynamicCellGraph(nn.Module):
         fallback[..., 0] = 1.0
         return torch.where(total > 0, chosen / total.clamp_min(1e-6), fallback)
 
-    def forward(self, anchor):
+    def forward(self, anchor, halt_head=None, halt_threshold=0.5,
+                physical_halt=False):
         B, T, _ = anchor.shape
         temperature = max(float(self.temperature), 1e-4)
         context = self.router.graph_context(anchor)
@@ -1841,9 +1854,13 @@ class FullFreeDynamicCellGraph(nn.Module):
         node_score_records = []
         edge_score_records = []
         halt_records = []
+        step_states = []
         alive = torch.ones(B, T, device=anchor.device, dtype=anchor.dtype)
+        sequence_alive = torch.ones(B, device=anchor.device, dtype=torch.bool)
 
         for step in range(self.num_steps):
+            if physical_halt and halt_head is not None and not sequence_alive.any():
+                break
             current = current + self.fixed_attentions[step](self.fixed_attention_norms[step](current))
             local_context = context + self.router.state_down(current)
             routed, node_scores = self.router.node_weights(
@@ -1918,6 +1935,11 @@ class FullFreeDynamicCellGraph(nn.Module):
 
             deltas = torch.stack(step_deltas, dim=2)
             current = current + (deltas * cell_weights.unsqueeze(-1)).sum(dim=2)
+            step_states.append(current)
+            if physical_halt and halt_head is not None:
+                stop_probability = halt_head(current).squeeze(-1).sigmoid().mean(dim=1)
+                sequence_alive = sequence_alive & (stop_probability < halt_threshold)
+                alive = alive * sequence_alive[:, None, None].to(alive.dtype)
             node_weights_records.append(cell_weights)
             node_mask_records.append(node_masks)
             node_score_records.append(node_scores[..., :self.cells_per_step])
@@ -1936,12 +1958,13 @@ class FullFreeDynamicCellGraph(nn.Module):
         self.last_node_scores = torch.cat(node_score_records, dim=-1)
         self.last_edge_scores = torch.stack(edge_score_records, dim=2)
         self.last_halt_weights = torch.stack(halt_records, dim=-1)
+        self.last_step_states = torch.stack(step_states, dim=2)
         self.last_depth = self._hard_depth(node_mask.detach(), edge_mask.detach())
         return current
 
     def _hard_depth(self, node_mask, edge_mask):
         depths = [torch.zeros_like(node_mask[..., 0])]
-        for node in range(self.num_cells):
+        for node in range(edge_mask.size(2)):
             selected = edge_mask[:, :, node, :node + 1].bool()
             prior_depths = torch.stack(depths, dim=-1)
             parent_depth = prior_depths.masked_fill(~selected, -1).max(dim=-1).values.clamp_min(0)
@@ -2007,6 +2030,19 @@ class GPTConfig:
     use_distillation: bool = False
     distillation_temperature: float = 2.0
     distillation_beta: float = 0.5
+    # Optional variational-style error signal. Kept disabled by default so
+    # existing experiments retain the original cross-entropy objective.
+    free_energy_enabled: bool = False
+    free_energy_prediction_weight: float = 1.0
+    free_energy_complexity_weight: float = 0.0
+    free_energy_temperature: float = 1.0
+    # Fraction of highest-free-energy valid tokens used for the update.
+    # 1.0 preserves dense training; lower values implement selective updates.
+    free_energy_update_fraction: float = 1.0
+    cell_graph_free_energy_enabled: bool = False
+    cell_graph_free_energy_prediction_weight: float = 1.0
+    cell_graph_free_energy_complexity_weight: float = 0.01
+    cell_graph_free_energy_loss_weight: float = 0.0
     enable_dynamic_depth: bool = False
     enable_dynamic_width: bool = False # alias; keeps depth/width switches independent
     dynamic_depth_choices: list = None # 1-indexed prefix depths, e.g. [2, 3, 4]
@@ -2223,6 +2259,13 @@ class GPT(nn.Module):
             "hardware_atom_route_scope must be 'token' or 'sequence'"
         assert config.hardware_atom_eval_impl in ("dense_full", "dense_mask", "grouped"), \
             "hardware_atom_eval_impl must be 'dense_full', 'dense_mask', or 'grouped'"
+        assert config.free_energy_prediction_weight >= 0.0
+        assert config.free_energy_complexity_weight >= 0.0
+        assert config.free_energy_temperature > 0.0
+        assert 0.0 < config.free_energy_update_fraction <= 1.0
+        assert config.cell_graph_free_energy_prediction_weight >= 0.0
+        assert config.cell_graph_free_energy_complexity_weight >= 0.0
+        assert config.cell_graph_free_energy_loss_weight >= 0.0
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -2237,6 +2280,7 @@ class GPT(nn.Module):
              if config.cell_graph_mode == "full_free" else DynamicCellGraph(config))
             if config.cell_graph else None
         )
+        self.cell_graph_halt_head = None
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.exit_layers = self._normalize_exit_layers(config.exit_layers) if config.dynamic_exit else []
         self.exit_heads = nn.ModuleDict()
@@ -3323,6 +3367,47 @@ class GPT(nn.Module):
         counts = valid.sum(dim=1).clamp_min(1)
         return (token_loss * valid).sum(dim=1) / counts
 
+    def _free_energy_loss_terms(self, logits, targets):
+        """Return decomposed predictive free-energy error terms."""
+        if not self.config.free_energy_enabled or targets is None:
+            return None
+        temperature = max(float(self.config.free_energy_temperature), 1e-6)
+        log_probs = F.log_softmax(logits / temperature, dim=-1)
+        probs = log_probs.exp()
+        valid = targets != -1
+        target_log_probs = log_probs.gather(
+            -1, targets.clamp_min(0).unsqueeze(-1)
+        ).squeeze(-1)
+        log_uniform = -math.log(logits.size(-1))
+        token_prediction_error = -target_log_probs
+        token_complexity = (probs * (log_probs - log_uniform)).sum(dim=-1)
+        token_free_energy = (
+            self.config.free_energy_prediction_weight * token_prediction_error
+            + self.config.free_energy_complexity_weight * token_complexity
+        )
+        selected = valid
+        if self.config.free_energy_update_fraction < 1.0:
+            valid_scores = token_free_energy.detach().masked_fill(~valid, -torch.inf)
+            count = max(1, math.ceil(
+                valid.sum().item() * self.config.free_energy_update_fraction
+            ))
+            top_indices = valid_scores.reshape(-1).topk(count).indices
+            selected = torch.zeros_like(valid.reshape(-1))
+            selected.scatter_(0, top_indices, True)
+            selected = selected.reshape_as(valid) & valid
+        prediction_error = token_prediction_error[selected].mean()
+        complexity = token_complexity[selected].mean()
+        free_energy = (
+            self.config.free_energy_prediction_weight * prediction_error
+            + self.config.free_energy_complexity_weight * complexity
+        )
+        return {
+            "prediction_error": prediction_error,
+            "complexity": complexity,
+            "free_energy": free_energy,
+            "selected_fraction": selected.float().sum() / valid.float().sum().clamp_min(1.0),
+        }
+
     def _dynamic_depth_loss_terms(self, targets):
         depth_logits = self.last_dynamic_depth_logits
         probs = self._dynamic_depth_probabilities()
@@ -3819,6 +3904,12 @@ class GPT(nn.Module):
             self.config.cell_graph_exploration = float(rate)
             self.cell_graph.exploration = float(rate)
 
+    def set_cell_graph_halt_head(self, halt_head):
+        """Attach an inference-time halt head used by physical early exit."""
+        if self.cell_graph is None:
+            raise RuntimeError("cell_graph is disabled")
+        self.cell_graph_halt_head = halt_head
+
     @torch.no_grad()
     def update_cell_graph_dual(self):
         """Projected dual ascent on the single average-active-cell constraint."""
@@ -3832,12 +3923,18 @@ class GPT(nn.Module):
         )
         return self.config.cell_graph_dual_value
 
-    def _forward_cell_graph_logits(self, idx, all_logits=False):
+    def _forward_cell_graph_logits(self, idx, all_logits=False, physical_halt=False,
+                                   halt_threshold=0.5):
         device = idx.device
         _, T = idx.shape
         pos = torch.arange(T, dtype=torch.long, device=device)
         anchor = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
-        hidden = self.cell_graph(anchor)
+        hidden = self.cell_graph(
+            anchor,
+            halt_head=self.cell_graph_halt_head,
+            halt_threshold=halt_threshold,
+            physical_halt=physical_halt,
+        )
         hidden = self.transformer.ln_f(hidden)
         return self.lm_head(hidden if all_logits else hidden[:, -1:, :])
 
@@ -3876,6 +3973,43 @@ class GPT(nn.Module):
         usage = node_probs.masked_select(token_valid).view(-1, graph.num_cells).float().mean(dim=0)
         balance = usage.var(unbiased=False)
         return budget, edge_cost, balance, expected_node_ratio
+
+    def _cell_graph_free_energy_terms(self, targets):
+        """Compute a local free-energy signal for every Cell Graph step.
+
+        Each intermediate graph state is asked to predict the next token, so
+        its cross-entropy is the local prediction error. The state complexity
+        is the Gaussian KL proxy to a zero-mean unit-variance prior. This is
+        an auxiliary training signal; it does not use targets to route during
+        inference.
+        """
+        if (not self.config.cell_graph_free_energy_enabled
+                or self.cell_graph.last_step_states is None):
+            return None
+        states = self.cell_graph.last_step_states
+        # [B, T, steps, C] -> [steps, B, T, vocab]
+        step_logits = self.lm_head(self.transformer.ln_f(states)).permute(2, 0, 1, 3)
+        valid = targets != -1
+        errors = []
+        complexities = []
+        for logits in step_logits:
+            errors.append(F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
+            ))
+        state_complexity = 0.5 * states.float().square().mean(dim=-1)
+        complexities = state_complexity[valid.unsqueeze(-1).expand_as(state_complexity)]
+        complexity = complexities.mean()
+        prediction_error = torch.stack(errors).mean()
+        free_energy = (
+            self.config.cell_graph_free_energy_prediction_weight * prediction_error
+            + self.config.cell_graph_free_energy_complexity_weight * complexity
+        )
+        return {
+            "prediction_error": prediction_error,
+            "complexity": complexity,
+            "free_energy": free_energy,
+            "per_step_prediction_error": torch.stack(errors),
+        }
 
     def _set_cell_graph_stats(self, valid_mask=None):
         graph = self.cell_graph
@@ -4023,22 +4157,32 @@ class GPT(nn.Module):
                 "edge_diversity_by_step": per_step,
             })
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, physical_halt=False, halt_threshold=0.5):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         if self.config.cell_graph:
-            logits = self._forward_cell_graph_logits(idx, all_logits=targets is not None)
+            logits = self._forward_cell_graph_logits(
+                idx,
+                all_logits=targets is not None,
+                physical_halt=physical_halt and targets is None,
+                halt_threshold=halt_threshold,
+            )
             valid = targets != -1 if targets is not None else None
-            self._set_cell_graph_stats(valid)
+            if physical_halt and targets is None:
+                self.last_cell_graph_stats = None
+            else:
+                self._set_cell_graph_stats(valid)
             if targets is None:
                 self.last_loss_stats = None
                 return logits, None
             task_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
             )
+            free_energy_terms = self._free_energy_loss_terms(logits, targets)
+            local_free_energy_terms = self._cell_graph_free_energy_terms(targets)
             budget, edge_cost, balance, expected_node_ratio = self._cell_graph_loss_terms(valid)
             expected_active_cells = expected_node_ratio * self.cell_graph.num_cells
             dual_penalty = expected_active_cells.new_zeros(())
@@ -4046,11 +4190,15 @@ class GPT(nn.Module):
                 dual_penalty = self.config.cell_graph_dual_value * (
                     expected_active_cells - self.config.cell_graph_active_cell_budget
                 ) / self.cell_graph.num_cells
-            loss = (task_loss
+            prediction_loss = (free_energy_terms["free_energy"]
+                               if free_energy_terms is not None else task_loss)
+            loss = (prediction_loss
                     + self.config.cell_graph_budget_weight * budget
                     + self.config.cell_graph_edge_cost_weight * edge_cost
                     + self.config.cell_graph_balance_weight * balance
                     + dual_penalty)
+            if local_free_energy_terms is not None:
+                loss = loss + self.config.cell_graph_free_energy_loss_weight * local_free_energy_terms["free_energy"]
             self.last_loss_stats = {
                 "task_loss": task_loss.detach().item(),
                 "cell_graph_budget_loss": budget.detach().item(),
@@ -4062,6 +4210,22 @@ class GPT(nn.Module):
                 "cell_graph_dual_value": float(self.config.cell_graph_dual_value),
                 "total_loss": loss.detach().item(),
             }
+            if free_energy_terms is not None:
+                self.last_loss_stats.update({
+                    "free_energy_prediction_error": free_energy_terms["prediction_error"].detach().item(),
+                    "free_energy_complexity": free_energy_terms["complexity"].detach().item(),
+                    "free_energy": free_energy_terms["free_energy"].detach().item(),
+                    "free_energy_selected_fraction": free_energy_terms["selected_fraction"].detach().item(),
+                })
+            if local_free_energy_terms is not None:
+                self.last_loss_stats.update({
+                    "cell_graph_free_energy_prediction_error": local_free_energy_terms["prediction_error"].detach().item(),
+                    "cell_graph_free_energy_complexity": local_free_energy_terms["complexity"].detach().item(),
+                    "cell_graph_free_energy": local_free_energy_terms["free_energy"].detach().item(),
+                    "cell_graph_free_energy_loss_weight": self.config.cell_graph_free_energy_loss_weight,
+                })
+                for step, value in enumerate(local_free_energy_terms["per_step_prediction_error"]):
+                    self.last_loss_stats[f"cell_graph_prediction_error_step{step}"] = value.detach().item()
             return logits, loss
 
         if self.config.dynamic_resource:
@@ -4072,6 +4236,7 @@ class GPT(nn.Module):
             dynamic_ce = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
             )
+            free_energy_terms = self._free_energy_loss_terms(logits, targets)
             saved_logits = self.last_dynamic_resource_logits
             saved_probs = self.last_dynamic_resource_probs
             saved_modes = self.last_dynamic_resource_modes
@@ -4091,7 +4256,9 @@ class GPT(nn.Module):
             distill = per_token_kl[valid].mean() * (temperature * temperature)
             costs = saved_probs.new_tensor([0.0, 0.125, 0.25, 0.50, 1.0])
             expected_compute = (saved_probs * costs).sum(dim=-1).sum(dim=-1).mean()
-            loss = (dynamic_ce
+            prediction_loss = (free_energy_terms["free_energy"]
+                               if free_energy_terms is not None else dynamic_ce)
+            loss = (prediction_loss
                     + self.config.dynamic_resource_full_ce_weight * full_ce
                     + self.config.dynamic_resource_distill_weight * distill
                     + self.config.dynamic_resource_compute_penalty_current * expected_compute)
@@ -4108,6 +4275,16 @@ class GPT(nn.Module):
                 "dynamic_resource_compute_weight": self.config.dynamic_resource_compute_penalty_current,
                 "total_loss": loss.detach().item(),
             }
+            if free_energy_terms is not None:
+                self.last_loss_stats["free_energy_selected_fraction"] = (
+                    free_energy_terms["selected_fraction"].detach().item()
+                )
+            if free_energy_terms is not None:
+                self.last_loss_stats.update({
+                    "free_energy_prediction_error": free_energy_terms["prediction_error"].detach().item(),
+                    "free_energy_complexity": free_energy_terms["complexity"].detach().item(),
+                    "free_energy": free_energy_terms["free_energy"].detach().item(),
+                })
             return logits, loss
 
         if self.config.enable_dynamic_depth and targets is None and not self.training:
@@ -4120,7 +4297,9 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             task_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            loss = task_loss
+            free_energy_terms = self._free_energy_loss_terms(logits, targets)
+            loss = (free_energy_terms["free_energy"]
+                    if free_energy_terms is not None else task_loss)
             dynamic_depth_terms = self._dynamic_depth_loss_terms(targets)
             if dynamic_depth_terms is not None:
                 loss = loss + self.config.dynamic_depth_early_ce_weight * dynamic_depth_terms["shallow_ce"]
@@ -4215,6 +4394,13 @@ class GPT(nn.Module):
                 "task_loss": task_loss.detach().item(),
                 "total_loss": loss.detach().item(),
             }
+            if free_energy_terms is not None:
+                self.last_loss_stats.update({
+                    "free_energy_prediction_error": free_energy_terms["prediction_error"].detach().item(),
+                    "free_energy_complexity": free_energy_terms["complexity"].detach().item(),
+                    "free_energy": free_energy_terms["free_energy"].detach().item(),
+                    "free_energy_selected_fraction": free_energy_terms["selected_fraction"].detach().item(),
+                })
             if dynamic_depth_terms is not None:
                 for depth, value in zip(self.config.dynamic_depth_choices, dynamic_depth_terms["mean_ce"]):
                     self.last_loss_stats[f"dynamic_depth_ce_d{depth}"] = value.detach().item()
